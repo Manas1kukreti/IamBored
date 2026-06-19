@@ -85,6 +85,8 @@ def validate_production_settings(settings: Settings) -> None:
     unsafe_jwt_secrets = {"change-me-in-production", "change-this-before-production"}
     if settings.jwt_secret_key in unsafe_jwt_secrets or len(settings.jwt_secret_key) < 32:
         raise ValueError("JWT_SECRET_KEY must be a unique production secret of at least 32 characters")
+    if settings.agent_callback_secret == "change-agent-callback-secret":
+        raise ValueError("AGENT_CALLBACK_SECRET must be set to the shared backend/agent callback secret")
     if settings.default_admin_password == "ChangeMeAdmin123" or len(settings.default_admin_password) < 12:
         raise ValueError("DEFAULT_ADMIN_PASSWORD must be changed before production deploy")
     if bool(settings.agent_email) != bool(settings.agent_password):

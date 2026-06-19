@@ -39,7 +39,7 @@ class BaseJobRepository(ABC):
         pass
 
     @abstractmethod
-    async def mark_callback_failed(self, job_id: str) -> None:
+    async def mark_callback_failed(self, job_id: str, error_msg: Optional[str] = None) -> None:
         pass
 
 class JobRepository(BaseJobRepository):
@@ -126,8 +126,10 @@ class JobRepository(BaseJobRepository):
             db[job_id]["error"] = reason
             self._write_db(db)
 
-    async def mark_callback_failed(self, job_id: str) -> None:
+    async def mark_callback_failed(self, job_id: str, error_msg: Optional[str] = None) -> None:
         db = self._read_db()
         if job_id in db:
             db[job_id]["status"] = "CALLBACK_FAILED"
+            if error_msg:
+                db[job_id]["error"] = error_msg
             self._write_db(db)

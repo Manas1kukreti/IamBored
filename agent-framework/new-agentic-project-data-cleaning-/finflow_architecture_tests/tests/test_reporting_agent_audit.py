@@ -25,6 +25,8 @@ from finflow_agent.agents.reporting_agent import (
     ReportingAgent,
     ReportingAgentParams,
 )
+from finflow_agent.operations.errors import ReportGenerationError
+from finflow_agent.operations.reporting_handlers import write_csv_report
 from finflow_agent.tools.column_resolver import ColumnResolution
 
 
@@ -300,6 +302,32 @@ def test_reporting_agent_returns_failed_on_missing_input_dataframe(tmp_path):
     )
 
 
+def test_reporting_agent_error_surfaces_output_context(tmp_path, monkeypatch):
+    df = _sample_df()
+
+    def boom(*args, **kwargs):
+        raise RuntimeError("disk full while writing csv")
+
+    monkeypatch.setattr(
+        "finflow_agent.agents.reporting_agent.execute_reporting_plan",
+        boom,
+    )
+
+    result = ReportingAgent().execute(
+        {
+            "plan": _csv_plan(),
+            "output_dir": str(tmp_path),
+            "file_prefix": "contextual_csv_output",
+        },
+        {"input_dataframe": df},
+    )
+
+    assert result.status == "failed"
+    assert "disk full while writing csv" in (result.error_message or "")
+    assert "output_format='csv'" in (result.error_message or "")
+    assert "file_prefix='contextual_csv_output'" in (result.error_message or "")
+
+
 # ---------------------------------------------------------------------------
 # 4. purity: agent must not mutate the dataframe
 # ---------------------------------------------------------------------------
@@ -371,6 +399,28 @@ def test_reporting_agent_csv_path_canonical_summary_still_applies(tmp_path):
 
     assert result.status == "success", result.error_message
     assert result.summary == "Data was normalized for filtering."
+
+
+def test_write_csv_report_error_includes_output_path(tmp_path, monkeypatch):
+    df = _sample_df()
+
+    def boom(self, *args, **kwargs):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(pd.DataFrame, "to_csv", boom)
+
+    with pytest.raises(ReportGenerationError) as exc:
+        write_csv_report(
+            df,
+            ReportingAgentParams.model_validate({"plan": _csv_plan()}).plan,
+            str(tmp_path),
+            "broken_report",
+        )
+
+    message = str(exc.value)
+    assert "Failed to write CSV report to path=" in message
+    assert "broken_report.csv" in message
+    assert "disk full" in message
 
 
 # ---------------------------------------------------------------------------

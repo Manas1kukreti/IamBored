@@ -62,11 +62,16 @@ async def send_backend_callback(result_payload: dict, job_id: str, repository: J
     Implements timeouts, retries, and transient failure backoff.
     """
     backend_url = os.environ.get("BACKEND_CALLBACK_URL", "http://backend:8000/api/agent/callback")
-    secret = os.environ.get("AGENT_CALLBACK_SECRET", "change-agent-callback-secret")
+    secret = os.environ.get("AGENT_CALLBACK_SECRET")
+    if not secret:
+        raise RuntimeError(
+            "AGENT_CALLBACK_SECRET is required for backend callbacks."
+        )
     
     max_retries = 3
     backoff = 1.0
     safe_payload = make_json_safe(result_payload)
+    last_error = None
     
     for attempt in range(max_retries):
         try:
@@ -82,18 +87,32 @@ async def send_backend_callback(result_payload: dict, job_id: str, repository: J
                 
                 # Check for non-retryable 4xx client errors (excluding 429)
                 if 400 <= response.status_code < 500 and response.status_code != 429:
-                    logger.error(f"Callback failed with client error {response.status_code}: {response.text}")
+                    last_error = (
+                        f"Backend callback rejected payload with HTTP {response.status_code}: "
+                        f"{response.text}"
+                    )
+                    logger.error(last_error)
                     break
-                    
-                logger.warning(f"Callback returned status {response.status_code}, retrying...")
+                
+                last_error = (
+                    f"Backend callback returned HTTP {response.status_code} on attempt "
+                    f"{attempt + 1}/{max_retries}: {response.text}"
+                )
+                logger.warning(f"{last_error}; retrying...")
         except Exception as e:
-            logger.warning(f"Callback request error on attempt {attempt + 1}: {e}")
+            last_error = (
+                f"Backend callback request error on attempt {attempt + 1}/{max_retries}: "
+                f"{e}"
+            )
+            logger.warning(last_error)
 
             
         if attempt < max_retries - 1:
             await asyncio.sleep(backoff)
             backoff *= 2.0
             
-    logger.error("Callback failed all retry attempts.")
+    if not last_error:
+        last_error = "Backend callback failed without a captured error."
+    logger.error(f"Callback failed all retry attempts. Final cause: {last_error}")
     # On final failure, mark job CALLBACK_FAILED but do not erase the successful job result
-    await repository.mark_callback_failed(job_id)
+    await repository.mark_callback_failed(job_id, last_error)

@@ -52,6 +52,21 @@ from finflow_agent.tools.column_resolver import ColumnResolution
 _FILTER_PREP_CANONICAL_SUMMARY = "Data was normalized for filtering."
 
 
+def _reporting_context(*, plan: ReportingOperationPlan | None = None, output_dir: str | None = None, file_prefix: str | None = None) -> str:
+    parts: list[str] = []
+    if plan is not None:
+        parts.append(f"output_format={plan.output_format!r}")
+        if plan.sheet_name:
+            parts.append(f"sheet_name={plan.sheet_name!r}")
+        if plan.title:
+            parts.append(f"title={plan.title!r}")
+    if output_dir is not None:
+        parts.append(f"output_dir={output_dir!r}")
+    if file_prefix is not None:
+        parts.append(f"file_prefix={file_prefix!r}")
+    return ", ".join(parts)
+
+
 class ReportingAgentParams(BaseModel):
     """Pydantic params model for the Reporting_Agent.
 
@@ -292,7 +307,10 @@ class ReportingAgent:
         except Exception as exc:
             return AgentResult(
                 status="failed",
-                error_message=f"Reporting failed: {exc}",
+                error_message=(
+                    "Reporting failed while writing deliverable "
+                    f"({_reporting_context(plan=plan, output_dir=output_dir, file_prefix=file_prefix)}): {exc}"
+                ),
             )
 
         final_path = (output.artifacts or {}).get("output_file_path")
@@ -340,7 +358,10 @@ class ReportingAgent:
             except Exception as exc:
                 return AgentResult(
                     status="failed",
-                    error_message=f"Failed to build reporting plan: {exc}",
+                    error_message=(
+                        "Failed to build reporting plan from params "
+                        f"(plan={plan_data!r}): {exc}"
+                    ),
                 )
 
         api_key = os.environ.get("GROQ_API_KEY")
@@ -359,7 +380,11 @@ class ReportingAgent:
         except Exception as exc:
             return AgentResult(
                 status="failed",
-                error_message=f"Failed to build reporting plan: {exc}",
+                error_message=(
+                    "Failed to build reporting plan from fallback params "
+                    f"(output_format={params.get('output_format', 'xlsx')!r}, "
+                    f"sheet_name={params.get('sheet_name')!r}, title={params.get('title')!r}): {exc}"
+                ),
             )
 
     def _build_plan_via_llm(self, instruction: str):
@@ -401,7 +426,7 @@ class ReportingAgent:
             return AgentResult(
                 status="failed",
                 error_message=(
-                    f"Failed to generate reporting plan via LLM: {exc}"
+                    f"Failed to generate reporting plan via LLM for instruction={instruction!r}: {exc}"
                 ),
             )
 
@@ -447,7 +472,10 @@ class ReportingAgent:
         except Exception as exc:
             return AgentResult(
                 status="failed",
-                error_message=f"Reporting failed: {exc}",
+                error_message=(
+                    "Reporting failed while writing audit workbook "
+                    f"({_reporting_context(plan=plan, output_dir=output_dir, file_prefix=file_prefix)}): {exc}"
+                ),
             )
 
         final_path = writer_result.get("output_file_path")

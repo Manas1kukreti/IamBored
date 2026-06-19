@@ -21,6 +21,7 @@ from finflow_agent.tools.column_resolver import (
     _LLMColumnChoice,
 )
 from finflow_agent.tools.dataframe_profile import profile_dataframe
+from finflow_agent.tools.predicate_grounder import LLMGroundingDecision
 
 
 _LLM_PATCH_TARGET = "finflow_agent.llm.get_chat_groq"
@@ -28,7 +29,7 @@ _LLM_PATCH_TARGET = "finflow_agent.llm.get_chat_groq"
 
 @pytest.fixture
 def sample_profile():
-    """Profile with columns that have NO string similarity to 'merchant'."""
+    """Profile with columns that stay below the deterministic LLM threshold."""
     df = pd.DataFrame({
         "Date": ["2024-01-01"],
         "Reference": ["REF001"],
@@ -61,19 +62,25 @@ def _mock_llm_returning(selected_column, reason="test"):
 # 1. LLM picks the right column when fuzzy fails
 # ---------------------------------------------------------------------------
 
-def test_llm_fallback_resolves_merchant_to_payment_mode(sample_profile):
-    mock_llm = _mock_llm_returning("Payment Mode", "merchant = payment method")
+def test_llm_fallback_resolves_settlement_gateway_to_payment_mode(sample_profile):
+    mock_llm = _mock_llm_returning(
+        "Payment Mode",
+        "settlement gateway = payment method",
+    )
     with patch(_LLM_PATCH_TARGET, return_value=mock_llm):
-        result = resolve_column("__merchant_column__", sample_profile)
+        result = resolve_column("__settlement_gateway_column__", sample_profile)
     assert result.confidence == _LLM_RESOLUTION_CONFIDENCE
     assert result.matched_column == "Payment Mode"
     assert "llm_semantic_match" in result.reason
 
 
-def test_llm_fallback_resolves_vendor_to_payment_mode(sample_profile):
-    mock_llm = _mock_llm_returning("Payment Mode", "vendor = payment channel")
+def test_llm_fallback_resolves_settlement_gateway_to_payment_mode_again(sample_profile):
+    mock_llm = _mock_llm_returning(
+        "Payment Mode",
+        "settlement gateway = payment channel",
+    )
     with patch(_LLM_PATCH_TARGET, return_value=mock_llm):
-        result = resolve_column("vendor", sample_profile)
+        result = resolve_column("settlement_gateway", sample_profile)
     assert result.confidence == _LLM_RESOLUTION_CONFIDENCE
     assert result.matched_column == "Payment Mode"
 
@@ -85,7 +92,7 @@ def test_llm_fallback_resolves_vendor_to_payment_mode(sample_profile):
 def test_llm_fallback_rejects_invented_column(sample_profile):
     mock_llm = _mock_llm_returning("Merchant Name", "invented")
     with patch(_LLM_PATCH_TARGET, return_value=mock_llm):
-        result = resolve_column("__merchant_column__", sample_profile)
+        result = resolve_column("__mystery_column__", sample_profile)
     assert result.confidence < CONFIDENCE_THRESHOLD
     assert "llm_semantic_match" not in result.reason
 
@@ -97,7 +104,7 @@ def test_llm_fallback_rejects_invented_column(sample_profile):
 def test_llm_fallback_returns_null_falls_through(sample_profile):
     mock_llm = _mock_llm_returning(None, "no match")
     with patch(_LLM_PATCH_TARGET, return_value=mock_llm):
-        result = resolve_column("__merchant_column__", sample_profile)
+        result = resolve_column("__mystery_column__", sample_profile)
     assert result.confidence < CONFIDENCE_THRESHOLD
 
 
@@ -107,7 +114,7 @@ def test_llm_fallback_returns_null_falls_through(sample_profile):
 
 def test_llm_fallback_graceful_on_network_error(sample_profile):
     with patch(_LLM_PATCH_TARGET, side_effect=Exception("timeout")):
-        result = resolve_column("__merchant_column__", sample_profile)
+        result = resolve_column("__mystery_column__", sample_profile)
     assert result.confidence < CONFIDENCE_THRESHOLD
 
 
@@ -117,7 +124,7 @@ def test_llm_fallback_graceful_on_parse_error(sample_profile):
     mock_structured.invoke.return_value = "garbage"
     mock_llm.with_structured_output.return_value = mock_structured
     with patch(_LLM_PATCH_TARGET, return_value=mock_llm):
-        result = resolve_column("__merchant_column__", sample_profile)
+        result = resolve_column("__mystery_column__", sample_profile)
     assert result.confidence < CONFIDENCE_THRESHOLD
 
 
@@ -128,7 +135,7 @@ def test_llm_fallback_graceful_on_parse_error(sample_profile):
 def test_llm_fallback_disabled_via_env(sample_profile, monkeypatch):
     monkeypatch.setenv("ENABLE_LLM_COLUMN_RESOLUTION", "false")
     with patch(_LLM_PATCH_TARGET, side_effect=AssertionError("should not call")):
-        result = resolve_column("__merchant_column__", sample_profile)
+        result = resolve_column("__mystery_column__", sample_profile)
     assert result.confidence < CONFIDENCE_THRESHOLD
 
 
@@ -159,25 +166,36 @@ def test_filter_agent_succeeds_with_llm_resolved_column(bootstrap_agents):
     from finflow_agent.agents.filter_agent import FilterAgent
 
     df = pd.DataFrame({
-        "Date": ["2024-01-01", "2024-01-02", "2024-01-03"],
-        "Payment Mode": ["UPI", "PayPal", "UPI"],
-        "Amount": [100, 200, 300],
+        "alpha": ["X", "Y", "X"],
+        "beta": ["A", "B", "A"],
+        "gamma": ["M", "N", "M"],
+        "delta": ["Q", "R", "Q"],
     })
-    mock_llm = _mock_llm_returning("Payment Mode", "merchant = payment method")
     plan = {
         "conditions": [
-            {"column": "__merchant_column__", "operator": "eq", "value": "PayPal"}
+            {
+                "column": "__mystery_column__",
+                "operator": "eq",
+                "value": "B",
+            }
         ],
         "logic": "and",
     }
-    with patch(_LLM_PATCH_TARGET, return_value=mock_llm):
+    with patch(
+        "finflow_agent.tools.predicate_grounder._llm_ground_clause",
+        return_value=LLMGroundingDecision(
+            selected_column="beta",
+            reason="mystery field resolves to beta",
+            confidence=0.91,
+        ),
+    ):
         result = FilterAgent().execute({"plan": plan}, {"input_dataframe": df})
 
     assert result.status == "success", result.error_message
     assert len(result.data) == 1
-    assert result.data.iloc[0]["Payment Mode"] == "PayPal"
+    assert result.data.iloc[0]["beta"] == "B"
     mapping = result.artifacts.get("column_mapping", [])
     assert len(mapping) == 1
-    assert mapping[0]["matched_column"] == "Payment Mode"
-    assert mapping[0]["confidence"] == _LLM_RESOLUTION_CONFIDENCE
-    assert "llm_semantic_match" in mapping[0]["reason"]
+    assert mapping[0]["matched_column"] == "beta"
+    assert mapping[0]["confidence"] >= 0.91
+    assert "semantic grounding (llm)" in mapping[0]["reason"]

@@ -2,11 +2,12 @@ import asyncio
 from datetime import datetime, timedelta
 from uuid import uuid4
 
-from fastapi import BackgroundTasks
+from fastapi import BackgroundTasks, HTTPException
 
 from app.api.agent import map_agent_status_to_submission_status, reconcile_callback_status, resolve_agent_artifact_path
-from app.api.uploads import _frame_from_structured_records, list_uploads, output_is_available, save_upload
+from app.api.uploads import _frame_from_structured_records, list_uploads, output_is_available, retry_upload, save_upload
 from app.models import Submission, SubmissionRecord, SubmissionStatus, User, UserRole
+from app.services.quarantine import requeue_submission
 
 
 class DummyUploadFile:
@@ -27,6 +28,16 @@ class FakeExecuteResult:
         return self
 
     def all(self):
+        return self._rows
+
+    def scalar_one_or_none(self):
+        if isinstance(self._rows, list):
+            return self._rows[0] if self._rows else None
+        return self._rows
+
+    def scalar_one(self):
+        if isinstance(self._rows, list):
+            return self._rows[0]
         return self._rows
 
 
@@ -55,6 +66,70 @@ class FakeDb:
 
     async def refresh(self, *_args, **_kwargs):
         return None
+
+
+def test_requeue_submission_error_includes_current_status():
+    async def run() -> str:
+        submission = Submission(
+            id=uuid4(),
+            file_name="sample.xlsx",
+            file_path="uploads/sample.xlsx",
+            file_size_bytes=1,
+            original_filename="sample.xlsx",
+            instruction="clean this",
+            output_format="XLSX",
+            user_id=uuid4(),
+            status=SubmissionStatus.running,
+        )
+
+        try:
+            await requeue_submission(FakeDb(), submission=submission)
+        except HTTPException as exc:
+            assert exc.status_code == 409
+            return exc.detail
+        raise AssertionError("Expected HTTPException")
+
+    detail = asyncio.run(run())
+    assert "cannot be requeued right now" in detail
+    assert "submission_status='running'" in detail
+    assert "payload_status='none'" in detail
+
+
+def test_retry_upload_error_includes_current_status(monkeypatch):
+    async def run() -> str:
+        user = User(
+            id=uuid4(),
+            full_name="Tester",
+            email="tester@example.com",
+            hashed_password="hashed",
+            role=UserRole.employee,
+        )
+        submission = Submission(
+            id=uuid4(),
+            file_name="sample.xlsx",
+            file_path="uploads/sample.xlsx",
+            file_size_bytes=1,
+            original_filename="sample.xlsx",
+            instruction="clean this",
+            output_format="XLSX",
+            user_id=user.id,
+            status=SubmissionStatus.running,
+        )
+        submission.user = user
+
+        monkeypatch.setattr("app.api.uploads.verify_upload_access", lambda submission, user: None)
+
+        try:
+            await retry_upload(submission.id, db=FakeDb(submission), user=user)
+        except HTTPException as exc:
+            assert exc.status_code == 409
+            return exc.detail
+        raise AssertionError("Expected HTTPException")
+
+    detail = asyncio.run(run())
+    assert "cannot be retried right now" in detail
+    assert "submission_status='running'" in detail
+    assert "payload_status='none'" in detail
 
 
 def test_submission_status_enum_contains_all_runtime_statuses():

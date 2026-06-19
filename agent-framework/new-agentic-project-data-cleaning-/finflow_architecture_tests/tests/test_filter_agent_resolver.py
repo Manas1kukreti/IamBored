@@ -25,9 +25,11 @@ import pandas as pd
 import pytest
 
 from finflow_agent.agents.filter_agent import FilterAgent, FilterAgentParams
+from finflow_agent.planning.intent_package import PackageStatus
 from finflow_agent.operations.schemas import FilterCondition, FilterOperationPlan
+from finflow_agent.planning.package_builder import build_intent_package
 from finflow_agent.tools import config as config_module
-from finflow_agent.tools.column_resolver import resolve_column
+from finflow_agent.tools.column_resolver import resolve_column, resolve_columns
 from finflow_agent.tools.dataframe_profile import profile_dataframe
 
 
@@ -63,6 +65,30 @@ def _eq(column: str, value: Any, case_sensitive: bool = False) -> Dict[str, Any]
         "value": value,
         "case_sensitive": case_sensitive,
     }
+
+
+def _intent_package_for_df(
+    df: pd.DataFrame,
+    plan: Dict[str, Any],
+    *,
+    submission_id: str = "test-submission",
+) -> Any:
+    profile = profile_dataframe(df, include_samples=False)
+    requested_fields = [cond["column"] for cond in plan["conditions"]]
+    filter_values = [
+        str(cond["value"]) if cond.get("value") is not None else None
+        for cond in plan["conditions"]
+    ]
+    resolutions = resolve_columns(
+        requested_fields,
+        profile,
+        filter_values=filter_values,
+    )
+    return build_intent_package(
+        submission_id=submission_id,
+        resolutions=resolutions,
+        filter_values=filter_values,
+    )
 
 
 @pytest.fixture(autouse=True)
@@ -130,7 +156,8 @@ def test_filter_agent_publishes_column_mapping_artifact(bootstrap_agents):
     )
 
     result = FilterAgent().execute(
-        {"plan": plan}, {"input_dataframe": df}
+        {"plan": plan},
+        {"input_dataframe": df, "intent_package": _intent_package_for_df(df, plan)},
     )
 
     # The status may be "success" or "failed" depending on whether the
@@ -180,7 +207,10 @@ def test_filter_agent_low_confidence_policy_warn(
     )
     df, plan = _low_confidence_setup()
 
-    result = FilterAgent().execute({"plan": plan}, {"input_dataframe": df})
+    result = FilterAgent().execute(
+        {"plan": plan},
+        {"input_dataframe": df, "intent_package": _intent_package_for_df(df, plan)},
+    )
 
     # warn = continue with offending condition skipped.
     assert result.status == "success"
@@ -205,7 +235,10 @@ def test_filter_agent_low_confidence_policy_fail(
     )
     df, plan = _low_confidence_setup()
 
-    result = FilterAgent().execute({"plan": plan}, {"input_dataframe": df})
+    result = FilterAgent().execute(
+        {"plan": plan},
+        {"input_dataframe": df, "intent_package": _intent_package_for_df(df, plan)},
+    )
 
     assert result.status == "failed"
     assert result.error_message is not None
@@ -225,7 +258,10 @@ def test_filter_agent_low_confidence_policy_quarantine(
     )
     df, plan = _low_confidence_setup()
 
-    result = FilterAgent().execute({"plan": plan}, {"input_dataframe": df})
+    result = FilterAgent().execute(
+        {"plan": plan},
+        {"input_dataframe": df, "intent_package": _intent_package_for_df(df, plan)},
+    )
 
     # Quarantine surfaces as a failed envelope to the engine, but with
     # a structured ``quarantine`` artifact attached.
@@ -262,7 +298,10 @@ def test_filter_agent_high_confidence_match_applies_filter(bootstrap_agents):
         logic="and",
     )
 
-    result = FilterAgent().execute({"plan": plan}, {"input_dataframe": df})
+    result = FilterAgent().execute(
+        {"plan": plan},
+        {"input_dataframe": df, "intent_package": _intent_package_for_df(df, plan)},
+    )
 
     assert result.status == "success", result.error_message
     assert isinstance(result.data, pd.DataFrame)
@@ -332,7 +371,11 @@ def test_filter_agent_uses_only_input_dataframe_key(bootstrap_agents):
 
     result = FilterAgent().execute(
         {"plan": plan},
-        {"input_dataframe": df, "unrelated_state_key": decoy},
+        {
+            "input_dataframe": df,
+            "unrelated_state_key": decoy,
+            "intent_package": _intent_package_for_df(df, plan),
+        },
     )
 
     # The agent must compute its result from ``input_dataframe`` only.
@@ -363,7 +406,10 @@ def test_filter_agent_rewrites_condition_column_to_resolved_match(
     )
     plan = _plan_dict([_eq("gender", "female")])  # lowercase request
 
-    result = FilterAgent().execute({"plan": plan}, {"input_dataframe": df})
+    result = FilterAgent().execute(
+        {"plan": plan},
+        {"input_dataframe": df, "intent_package": _intent_package_for_df(df, plan)},
+    )
 
     assert result.status == "success", result.error_message
 
@@ -379,6 +425,47 @@ def test_filter_agent_rewrites_condition_column_to_resolved_match(
     # invoking the deterministic executor, so filtering succeeded.
     assert isinstance(result.data, pd.DataFrame)
     assert "Gender" in result.data.columns
+
+
+def test_filter_agent_returns_empty_result_on_missing_value_domain(bootstrap_agents, monkeypatch):
+    monkeypatch.delenv("GROQ_API_KEY", raising=False)
+    monkeypatch.setenv("ENABLE_LLM_COLUMN_RESOLUTION", "false")
+
+    df = pd.DataFrame(
+        {
+            "Product_Name": ["Headphones", "Coffee", "Tablet", "Tab"],
+            "Status": ["Pending", "completed", "completed", "Pending"],
+        }
+    )
+    plan = _plan_dict(
+        [
+            _eq("Product_Name", "Laptop"),
+            _eq("Status", "completed"),
+        ],
+        logic="and",
+    )
+
+    intent_pkg = _intent_package_for_df(df, plan)
+    result = FilterAgent().execute(
+        {"plan": plan},
+        {"input_dataframe": df, "intent_package": intent_pkg},
+    )
+
+    assert result.status == "success"
+    assert result.error_message is None
+    assert isinstance(result.data, pd.DataFrame)
+    assert result.data.empty
+
+    value_resolution = result.artifacts.get("value_resolution") or []
+    assert value_resolution
+    assert any(
+        entry["requested_value"] == "Laptop" and entry["matched"] is False
+        for entry in value_resolution
+    )
+    assert result.warnings
+    assert "zero rows" in " ".join(result.warnings).lower()
+    assert intent_pkg.status == PackageStatus.VALID
+    assert len(intent_pkg.violations) == 0
 
 
 def test_column_resolver_canonicalizes_placeholder_wrappers():

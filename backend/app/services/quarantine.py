@@ -28,6 +28,16 @@ def build_quarantine_title(submission: Submission) -> str:
     return submission.file_name
 
 
+def _requeue_blocked_detail(submission: Submission) -> str:
+    normalized_status = normalize_submission_status(submission.status)
+    payload = submission.summary if isinstance(submission.summary, dict) else {}
+    payload_status = str(payload.get("status", "")).strip().lower() or "none"
+    return (
+        "This workflow cannot be requeued right now "
+        f"(submission_status={normalized_status!r}, payload_status={payload_status!r})."
+    )
+
+
 async def list_quarantined_submissions(db: AsyncSession) -> list[Submission]:
     payload_status = func.coalesce(Submission.summary["status"].astext, "")
     return (
@@ -58,7 +68,10 @@ async def requeue_submission(
         SubmissionStatus.quarantined.value,
         SubmissionStatus.declined.value,
     } and not is_quarantined_submission(submission):
-        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="This workflow cannot be requeued right now")
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=_requeue_blocked_detail(submission),
+        )
 
     submission.status = SubmissionStatus.queued
     submission.agent_task_id = None

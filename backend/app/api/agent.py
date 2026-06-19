@@ -41,6 +41,19 @@ def _clean_error_text(value: object) -> str:
     return text
 
 
+def _callback_persistence_error_detail(
+    *,
+    event_id: str,
+    submission_id: str,
+    exc: Exception,
+) -> str:
+    return (
+        "Failed to persist agent callback "
+        f"(event_id={event_id}, submission_id={submission_id}, "
+        f"exception={exc.__class__.__name__}): {_clean_error_text(exc)}"
+    )
+
+
 def resolve_agent_artifact_path(result_payload: dict | None) -> Path | None:
     if not isinstance(result_payload, dict):
         return None
@@ -527,6 +540,11 @@ async def agent_callback(
         }
     except Exception as exc:
         await db.rollback()
+        detail = _callback_persistence_error_detail(
+            event_id=event_id,
+            submission_id=payload.submission_id,
+            exc=exc,
+        )
         logger.exception(
             "Callback primary persistence failed event_id=%s job_id=%s submission_id=%s primary_commit_status=failed exception=%s message=%s",
             event_id,
@@ -535,7 +553,10 @@ async def agent_callback(
             exc.__class__.__name__,
             _clean_error_text(exc),
         )
-        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Failed to persist agent callback") from exc
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=detail,
+        ) from exc
 
     await db.refresh(submission)
 

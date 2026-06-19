@@ -42,7 +42,6 @@ services:
       REDIS_URL: redis://redis:6379/0
       AGENT_BASE_URL: http://agent-service:8001
       BACKEND_CALLBACK_URL: http://backend:8000/api/agent/callback
-      AGENT_CALLBACK_SECRET: change-agent-callback-secret
       AGENT_REGISTRY_SECRET: change-agent-registry-secret
       UPLOAD_DIR: /app/storage/uploads
       OUTPUT_DIR: /app/storage/outputs
@@ -72,8 +71,8 @@ services:
       PORT: 8001
       DATABASE_URL: postgresql://personalagent:personalagent@postgres:5432/personalagent
       BACKEND_BASE_URL: http://backend:8000
-      AGENT_CALLBACK_SECRET: change-agent-callback-secret
       AGENT_REGISTRY_SECRET: change-agent-registry-secret
+      ENABLE_LLM_PREDICATE_GROUNDING: "true"
       UPLOAD_DIR: /app/storage/uploads
       OUTPUT_DIR: /app/storage/outputs
       REDIS_URL: redis://redis:6379/0

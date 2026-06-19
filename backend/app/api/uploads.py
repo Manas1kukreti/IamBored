@@ -1282,7 +1282,16 @@ async def retry_upload(
         raise HTTPException(status_code=404, detail="Submission not found")
     verify_upload_access(submission, user)
     if _submission_status_text(submission.status) not in FAILED_SUBMISSION_STATUSES | {SubmissionStatus.succeeded.value} and not is_quarantined_submission(submission):
-        raise HTTPException(status_code=409, detail="This workflow cannot be retried right now")
+        payload = submission.summary if isinstance(submission.summary, dict) else {}
+        payload_status = str(payload.get("status", "")).strip().lower() or "none"
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "This workflow cannot be retried right now "
+                f"(submission_status={_submission_status_text(submission.status)!r}, "
+                f"payload_status={payload_status!r})."
+            ),
+        )
 
     try:
         await requeue_submission(db, submission=submission, actor=user)

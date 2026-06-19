@@ -1,4 +1,3 @@
-import json
 from types import SimpleNamespace
 
 import pytest
@@ -113,7 +112,7 @@ async def test_engine_failure_summary_preserved(monkeypatch, tmp_path):
         async def mark_quarantined(self, job_id, reason):
             raise AssertionError("Should not quarantine in this test")
 
-        async def mark_callback_failed(self, job_id):
+        async def mark_callback_failed(self, job_id, error_msg=None):
             pass
 
     class FakeFileStore:
@@ -127,7 +126,7 @@ async def test_engine_failure_summary_preserved(monkeypatch, tmp_path):
             return object()
 
     class FakeEngine:
-        def execute(self, plan):
+        def execute(self, plan, submission_id=None):
             return {
                 "status": "failed",
                 "output_path": None,
@@ -159,6 +158,7 @@ async def test_engine_failure_summary_preserved(monkeypatch, tmp_path):
         },
     )
 
+    assert "Step 'calculate' failed:" in stored["failed_error"]
     assert "Missing required columns" in stored["failed_error"]
     assert stored["callback_payload"]["status"] == "failed"
-    assert "Missing required columns" in json.dumps(stored["callback_payload"]["summary"])
+    assert "Missing required columns" in str(stored["callback_payload"]["summary"])

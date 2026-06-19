@@ -23,6 +23,23 @@ from finflow_agent.operations.cleaning_handlers import (
 from finflow_agent.operations.errors import UnsafeFilterPrepOperationError
 from finflow_agent.llm import get_chat_groq
 
+
+def _summarize_cleaning_plan(plan: Optional[CleaningOperationPlan]) -> str:
+    if plan is None or not getattr(plan, "operations", None):
+        return "no operations"
+    parts: List[str] = []
+    for op in list(plan.operations)[:4]:
+        op_type = getattr(op, "type", None) or op.__class__.__name__
+        column = getattr(op, "column", None)
+        columns = getattr(op, "columns", None)
+        if column:
+            parts.append(f"{op_type}(column={column})")
+        elif columns:
+            parts.append(f"{op_type}(columns={columns})")
+        else:
+            parts.append(str(op_type))
+    return ", ".join(parts)
+
 # Confidence threshold for "safe" type-detection conversions in filter_prep mode.
 # A conversion is only applied to a column when at least this fraction of the
 # column's non-null values parse cleanly under the candidate semantic type.
@@ -171,7 +188,13 @@ class CleaningAgent:
                     "instruction": instruction,
                 })
             except Exception as e:
-                return AgentResult(status="failed", error_message=f"Failed to generate cleaning plan via LLM: {str(e)}")
+                return AgentResult(
+                    status="failed",
+                    error_message=(
+                        "Failed to generate cleaning plan via LLM for "
+                        f"instruction={instruction!r}: {e}"
+                    ),
+                )
 
             # Defensive validation: the structured-output binding should
             # already produce a validated model, but re-validate when the
@@ -206,13 +229,22 @@ class CleaningAgent:
                     else:
                         plan = CleaningOperationPlan.model_validate(plan_data)
                 except Exception as e:
-                    return AgentResult(status="failed", error_message=f"Invalid cleaning parameters: {str(e)}")
+                    return AgentResult(
+                        status="failed",
+                        error_message=f"Invalid cleaning parameters in plan payload {plan_data!r}: {e}",
+                    )
 
         # Strict parameter validation
         try:
             CleaningAgentParams.model_validate({"plan": plan})
         except ValidationError as e:
-            return AgentResult(status="failed", error_message=f"Invalid parameter schema for CleaningAgent: {str(e)}")
+            return AgentResult(
+                status="failed",
+                error_message=(
+                    "Invalid parameter schema for CleaningAgent "
+                    f"(plan_operations={_summarize_cleaning_plan(plan)}): {e}"
+                ),
+            )
 
         try:
             output = execute_cleaning_plan(df.copy(), plan)
@@ -226,7 +258,14 @@ class CleaningAgent:
                 artifacts=output.artifacts
             )
         except Exception as e:
-            return AgentResult(status="failed", error_message=f"Failed to execute cleaning plan: {str(e)}")
+            return AgentResult(
+                status="failed",
+                error_message=(
+                    "Failed to execute cleaning plan with operations "
+                    f"[{_summarize_cleaning_plan(plan)}] on dataframe columns "
+                    f"{list(df.columns)}: {e}"
+                ),
+            )
 
     # ------------------------------------------------------------------
     # Non-destructive `filter_prep` path (Component 7 / task 5.1).
@@ -348,6 +387,29 @@ class CleaningAgent:
                 "duration_ms": finished_at - started_at,
                 "origin": "filter_prep",
             })
+
+        # Contract check: verify filter_prep didn't unexpectedly drop columns
+        # that downstream agents need
+        intent_package = input_data.get("intent_package")
+        if intent_package is not None:
+            for rc in intent_package.resolved_columns:
+                if rc.resolved_column not in df_work.columns:
+                    from finflow_agent.planning.intent_package import ContractViolation
+                    violation = ContractViolation(
+                        step_id="filter_prep",
+                        agent="cleaning_agent",
+                        violation_type="column_dropped_by_prep",
+                        expected=rc.resolved_column,
+                        actual=f"columns_after_prep={list(df_work.columns)}",
+                    )
+                    intent_package.add_violation(violation)
+                    return AgentResult(
+                        status="failed",
+                        error_message=(
+                            f"Contract violation: filter_prep dropped column "
+                            f"{rc.resolved_column!r} needed by downstream agents."
+                        ),
+                    )
 
         return AgentResult(
             status="success",

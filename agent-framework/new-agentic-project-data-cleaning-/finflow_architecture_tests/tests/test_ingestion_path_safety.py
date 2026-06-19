@@ -195,3 +195,23 @@ def test_ingestion_agent_falls_back_when_upload_dir_unset(tmp_path, monkeypatch)
     assert result.status == "success", result.error_message
     assert result.metrics.get("row_count") == 1
     assert result.metrics.get("column_count") == 2
+
+
+def test_ingestion_agent_parse_error_includes_file_context(tmp_path, monkeypatch):
+    from finflow_agent.agents.ingestion_agent import IngestionAgent
+
+    monkeypatch.delenv("UPLOAD_DIR", raising=False)
+
+    missing_excel = tmp_path / "broken.xlsx"
+    missing_excel.write_text("not a real excel file", encoding="utf-8")
+
+    result = IngestionAgent().execute(
+        {"resolved_file_path": str(missing_excel), "file_type": "xlsx"},
+        {},
+    )
+
+    assert result.status == "failed"
+    assert result.error_message is not None
+    assert "failed to parse input file" in result.error_message.lower()
+    assert "broken.xlsx" in result.error_message
+    assert "file_type='xlsx'" in result.error_message

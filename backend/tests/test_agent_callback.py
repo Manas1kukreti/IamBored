@@ -256,3 +256,45 @@ def test_agent_callback_rejects_invalid_secret(monkeypatch):
         assert fake_db.added == []
 
     asyncio.run(run())
+
+
+def test_agent_callback_persistence_failure_surfaces_context(monkeypatch):
+    async def run() -> None:
+        submission = _build_submission()
+
+        class FailingCommitDb(FakeCallbackDb):
+            async def commit(self):
+                self.commit_count += 1
+                raise RuntimeError("database write blocked")
+
+        fake_db = FailingCommitDb(submission, table_exists=True)
+        settings = type(
+            "Settings",
+            (),
+            {
+                "agent_callback_secret": "test-secret",
+                "enable_needs_review_jobs": True,
+            },
+        )()
+
+        monkeypatch.setattr("app.api.agent.get_settings", lambda: settings)
+
+        payload = AgentCallbackPayload(
+            submission_id=str(submission.id),
+            status="failed",
+            summary={"error": "persist me"},
+        )
+
+        with pytest.raises(HTTPException) as exc:
+            await agent_callback(
+                payload,
+                DummyRequest({"Authorization": "Bearer test-secret"}),
+                fake_db,
+            )
+
+        assert exc.value.status_code == 500
+        assert "Failed to persist agent callback" in exc.value.detail
+        assert str(submission.id) in exc.value.detail
+        assert "database write blocked" in exc.value.detail
+
+    asyncio.run(run())

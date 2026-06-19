@@ -138,6 +138,17 @@ _KNOWN_SYNONYMS: Mapping[str, frozenset[str]] = {
             "class",
             "tier",
             "segment",
+            "merchant",
+            "vendor",
+            "seller",
+            "payee",
+            "payment_method",
+            "payment_mode",
+            "payment_type",
+            "pay_method",
+            "mode_of_payment",
+            "tender_type",
+            "channel",
         }
     ),
     "boolean": frozenset(
@@ -294,6 +305,7 @@ def _try_llm_column_resolution(
     requested_field: str,
     canonical_field: str,
     profile: DataFrameProfile,
+    filter_value: Optional[str] = None,
 ) -> Optional[ColumnResolution]:
     """Attempt a constrained LLM call to resolve an ambiguous column reference.
 
@@ -329,19 +341,73 @@ def _try_llm_column_resolution(
         llm = get_chat_groq(model_name="llama-3.3-70b-versatile", temperature=0)
         structured_llm = llm.with_structured_output(_LLMColumnChoice)
 
-        # The prompt is intentionally minimal and constrained:
-        # - Only column names are sent (no row data, no sensitive values)
-        # - The LLM must pick from the exact list or say null
-        # - No code generation or free-form operations allowed
-        prompt_text = (
-            f"A user referenced a data column using the term: \"{canonical_field}\"\n\n"
-            f"The actual columns available in their spreadsheet are:\n"
-            + "\n".join(f"- {col}" for col in available_columns)
-            + "\n\n"
-            f"Which column most likely corresponds to \"{canonical_field}\"?\n"
-            f"Select exactly one column name from the list above.\n"
-            f"If no column is a reasonable match, set selected_column to null.\n"
-            f"You MUST select a column name exactly as written above — do not invent new names."
+        # Build column descriptions with richer semantic context.
+        column_descriptions = []
+        for col in profile.columns:
+            desc = (
+                f"- {col.original_name} "
+                f"(semantic_guess: {col.semantic_guess}, "
+                f"dtype: {col.dtype}, distinct: {col.distinct_count}"
+            )
+            if col.representative_values:
+                samples_str = ", ".join(repr(s) for s in col.representative_values[:3])
+                desc += f", representative: [{samples_str}]"
+            if col.frequent_values:
+                samples_str = ", ".join(repr(s) for s in col.frequent_values[:3])
+                desc += f", frequent: [{samples_str}]"
+            if col.random_distinct_values:
+                samples_str = ", ".join(repr(s) for s in col.random_distinct_values[:3])
+                desc += f", random: [{samples_str}]"
+            if col.rare_values:
+                samples_str = ", ".join(repr(s) for s in col.rare_values[:3])
+                desc += f", rare: [{samples_str}]"
+            desc += ")"
+            column_descriptions.append(desc)
+
+        # Build a prompt with enough context for the LLM to understand
+        # the semantic relationship between the user's term and the columns.
+        prompt_parts = []
+        prompt_parts.append(
+            f'A user wants to filter their spreadsheet data. '
+            f'They referenced a column using the term: "{canonical_field}"'
+        )
+        if filter_value:
+            prompt_parts.append(
+                f'They want to find rows where this column equals "{filter_value}".'
+            )
+        prompt_parts.append("")
+        prompt_parts.append("The actual columns available in their spreadsheet are:")
+        prompt_parts.extend(column_descriptions)
+        prompt_parts.append("")
+        prompt_parts.append(
+            f'Which column most likely corresponds to what the user means by "{canonical_field}"?'
+        )
+        prompt_parts.append("Consider that users often use informal or related terms. For example:")
+        prompt_parts.append('- "product" often means a product/name/item column')
+        prompt_parts.append('- "date" could mean transaction date, created date, etc.')
+        prompt_parts.append('- "amount" could mean price, total, cost, etc.')
+        prompt_parts.append('- "status" often means pending/completed/failed state columns')
+        if filter_value:
+            prompt_parts.append(
+                f'\nHint: the value "{filter_value}" should help identify which '
+                f'column the user is referring to — look for a column whose '
+                f'sample values are similar in kind to "{filter_value}".'
+            )
+        prompt_parts.append("")
+        prompt_parts.append("Rules:")
+        prompt_parts.append("- Select exactly one column name from the list above.")
+        prompt_parts.append("- You MUST use the exact column name as written above.")
+        prompt_parts.append("- If no column is a reasonable semantic match, set selected_column to null.")
+        prompt_parts.append("- Do NOT invent new column names.")
+        prompt_parts.append("- Prefer columns whose sample values match the kind of value the user is filtering for.")
+
+        prompt_text = "\n".join(prompt_parts)
+
+        logger.info(
+            "LLM column resolution: invoking for field=%r, canonical=%r, "
+            "filter_value=%r, columns=%r",
+            requested_field, canonical_field, filter_value,
+            [c.original_name for c in profile.columns],
         )
 
         result = structured_llm.invoke(prompt_text)
@@ -417,6 +483,7 @@ def _try_llm_column_resolution(
 def resolve_column(
     requested_field: str,
     profile: DataFrameProfile,
+    filter_value: Optional[str] = None,
 ) -> ColumnResolution:
     """Resolve *requested_field* against the columns in *profile*.
 
@@ -473,6 +540,7 @@ def resolve_column(
         requested_field=requested_field,
         canonical_field=canonical_requested_field,
         profile=profile,
+        filter_value=filter_value,
     )
     if llm_result is not None:
         return llm_result
@@ -491,13 +559,21 @@ def resolve_column(
 def resolve_columns(
     requested_fields: List[str],
     profile: DataFrameProfile,
+    filter_values: Optional[List[Optional[str]]] = None,
 ) -> List[ColumnResolution]:
     """Resolve every entry in *requested_fields* against *profile*.
 
-    Deterministic: the same ``(requested_fields, profile)`` pair always
-    produces the same list, in the same order (acceptance criterion 7.5).
+    When *filter_values* is provided, each value is passed to the LLM
+    fallback tier as additional context to improve semantic resolution.
+    For example, if ``requested_fields=["__merchant_column__"]`` and
+    ``filter_values=["PayPal"]``, the LLM knows the user is looking for
+    a payment-related column.
     """
-    return [resolve_column(field, profile) for field in requested_fields]
+    values = filter_values or [None] * len(requested_fields)
+    return [
+        resolve_column(field, profile, filter_value=val)
+        for field, val in zip(requested_fields, values)
+    ]
 
 
 # ---------------------------------------------------------------------------

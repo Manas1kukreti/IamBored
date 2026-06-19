@@ -8,5 +8,5 @@ class JobRunner:
     def __init__(self):
         self.engine = ExecutionEngine()
 
-    def run_job(self, plan: ExecutionPlan) -> dict:
-        return self.engine.execute(plan)
+    def run_job(self, plan: ExecutionPlan, submission_id: str | None = None) -> dict:
+        return self.engine.execute(plan, submission_id=submission_id)

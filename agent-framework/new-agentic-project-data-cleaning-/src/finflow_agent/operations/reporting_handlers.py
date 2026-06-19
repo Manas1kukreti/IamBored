@@ -37,7 +37,9 @@ def write_xlsx_report(df: pd.DataFrame, plan: ReportingOperationPlan, output_dir
                 max_len = max(df[col].astype(str).map(len).max(), len(col)) + 2
                 worksheet.set_column(i, i, max_len)
     except Exception as e:
-        raise ReportGenerationError(f"Failed to write XLSX: {e}")
+        raise ReportGenerationError(
+            f"Failed to write XLSX report to path={str(safe_path)!r}: {e}"
+        )
     return {"output_file_path": str(safe_path)}
 
 def write_csv_report(df: pd.DataFrame, plan: ReportingOperationPlan, output_dir: str, file_prefix: str, **kwargs) -> Dict[str, Any]:
@@ -45,7 +47,9 @@ def write_csv_report(df: pd.DataFrame, plan: ReportingOperationPlan, output_dir:
     try:
         df.to_csv(safe_path, index=False, encoding='utf-8')
     except Exception as e:
-        raise ReportGenerationError(f"Failed to write CSV: {e}")
+        raise ReportGenerationError(
+            f"Failed to write CSV report to path={str(safe_path)!r}: {e}"
+        )
     return {"output_file_path": str(safe_path)}
 
 def write_json_report(df: pd.DataFrame, plan: ReportingOperationPlan, output_dir: str, file_prefix: str, **kwargs) -> Dict[str, Any]:
@@ -57,7 +61,9 @@ def write_json_report(df: pd.DataFrame, plan: ReportingOperationPlan, output_dir
         with open(safe_path, 'w', encoding='utf-8') as f:
             f.write(json_str)
     except Exception as e:
-        raise ReportGenerationError(f"Failed to write JSON: {e}")
+        raise ReportGenerationError(
+            f"Failed to write JSON report to path={str(safe_path)!r}: {e}"
+        )
     return {"output_file_path": str(safe_path)}
 
 def write_txt_report(df: pd.DataFrame, plan: ReportingOperationPlan, output_dir: str, file_prefix: str, **kwargs) -> Dict[str, Any]:
@@ -68,7 +74,9 @@ def write_txt_report(df: pd.DataFrame, plan: ReportingOperationPlan, output_dir:
                 f.write(f"{plan.title}\n{'=' * len(plan.title)}\n\n")
             f.write(df.to_string(index=False))
     except Exception as e:
-        raise ReportGenerationError(f"Failed to write TXT: {e}")
+        raise ReportGenerationError(
+            f"Failed to write TXT report to path={str(safe_path)!r}: {e}"
+        )
     return {"output_file_path": str(safe_path)}
 
 REPORTING_HANDLERS = {
@@ -427,7 +435,7 @@ def write_excel_with_audit_sheets(
         raise
     except Exception as e:
         raise ReportGenerationError(
-            f"Failed to write audit Excel file: {e}"
+            f"Failed to write audit Excel file to path={str(safe_path)!r}: {e}"
         ) from e
 
     return {

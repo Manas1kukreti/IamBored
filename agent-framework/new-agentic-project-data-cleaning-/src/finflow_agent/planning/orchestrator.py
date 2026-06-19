@@ -167,6 +167,23 @@ Filter operation rules:
 - Use only these filter operators: ``eq``, ``neq``, ``gt``, ``gte``, ``lt``,
   ``lte``, ``contains``, ``not_contains``, ``starts_with``, ``ends_with``,
   ``between``, ``in``, ``not_in``, ``is_null``, ``is_not_null``.
+- IMPORTANT: When the user says "only return column X", "show only X",
+  "give me just X", or "return only X columns", this means COLUMN
+  SELECTION. Set ``needs_filtering`` to true and include a ``filter_plan``
+  with ``select_columns`` listing the requested column names. The
+  ``conditions`` list may be empty if no row filtering is needed.
+  Example: "only return Customer Id" →
+  {{
+    "needs_filtering": true,
+    "filter_plan": {{
+      "conditions": [],
+      "select_columns": ["Customer_ID"],
+      "logic": "and"
+    }}
+  }}
+- Column selection phrases include: "only return", "only show", "show only",
+  "give me only", "return only", "keep only", "select only", "just show",
+  "just the", "extract only".
 
 Calculation operation rules:
 - Use only these calculation types: ``sum``, ``mean``, ``median``, ``min``,
@@ -289,6 +306,22 @@ Calculation operation rules:
         if isinstance(intent_or_quarantine, dict):
             return intent_or_quarantine
         intent: PlanIntent = intent_or_quarantine
+
+        # ----------------------------------------------------------------
+        # Phase 1.5: Post-LLM intent normalization (deterministic).
+        #
+        # Catches column-selection patterns the LLM missed. For example,
+        # "only return Customer Id" should produce needs_filtering=True
+        # with select_columns=["Customer_ID"], but LLMs sometimes miss
+        # this and only set needs_cleaning=True. The normalizer patches
+        # the intent without calling the LLM again.
+        # ----------------------------------------------------------------
+        from finflow_agent.planning.intent_normalizer import normalize_intent
+
+        available_columns = None
+        if profile is not None:
+            available_columns = [col.original_name for col in profile.columns]
+        intent = normalize_intent(intent, instruction, available_columns)
 
         # ----------------------------------------------------------------
         # Phase 2: Deterministic compile (NOT retried).
@@ -484,10 +517,15 @@ Calculation operation rules:
             }
 
         if result.get("is_quarantined"):
+            quarantine_reason = result.get("quarantine_reason")
+            if not quarantine_reason:
+                quarantine_reason = (
+                    "Planner marked the request as quarantined but did not provide "
+                    "a quarantine_reason."
+                )
             return {
                 "status": "quarantined",
-                "reason": result.get("quarantine_reason")
-                or "Request quarantined by Orchestrator.",
+                "reason": quarantine_reason,
                 "normalization_events": [],
             }
 
@@ -504,10 +542,15 @@ Calculation operation rules:
             }
 
         if intent.is_quarantined:
+            quarantine_reason = intent.quarantine_reason
+            if not quarantine_reason:
+                quarantine_reason = (
+                    "Validated PlanIntent is quarantined but did not include a "
+                    "quarantine_reason."
+                )
             return {
                 "status": "quarantined",
-                "reason": intent.quarantine_reason
-                or "Request quarantined by Orchestrator.",
+                "reason": quarantine_reason,
                 "normalization_events": normalization.events,
             }
 

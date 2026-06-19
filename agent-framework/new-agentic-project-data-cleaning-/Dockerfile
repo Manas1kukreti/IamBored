@@ -9,9 +9,5 @@ COPY src/ ./src/
 
 ENV PYTHONPATH=/app/src
 
-# We want to run both the API server (uvicorn) and the ARQ worker.
-# An easy way is to use a simple bash script.
-COPY run.sh .
-RUN chmod +x run.sh
-
-CMD ["./run.sh"]
+# Run the ARQ worker in the background and keep uvicorn as the main process.
+CMD ["sh", "-c", "arq finflow_agent.api.WorkerSettings & exec uvicorn finflow_agent.api:app --host 0.0.0.0 --port 8001"]

@@ -9,6 +9,26 @@ from finflow_agent.operations.schemas import CalculationOperationPlan, Calculati
 from finflow_agent.operations.executor import execute_calculation_plan
 from finflow_agent.llm import get_chat_groq
 
+
+def _summarize_calc_ops(operations: List[Dict[str, Any]] | List[CalculationOperation]) -> str:
+    parts: List[str] = []
+    for op in list(operations or [])[:3]:
+        if isinstance(op, dict):
+            op_type = op.get("type")
+            column = op.get("column")
+            secondary = op.get("secondary_column")
+        else:
+            op_type = getattr(op, "type", None)
+            column = getattr(op, "column", None)
+            secondary = getattr(op, "secondary_column", None)
+        label = str(op_type or "unknown")
+        if column:
+            label += f"(column={column})"
+        if secondary:
+            label += f"(secondary_column={secondary})"
+        parts.append(label)
+    return ", ".join(parts) if parts else "no operations provided"
+
 class CalculationAgentParams(BaseModel):
     instruction: Optional[str] = None
     operations: List[CalculationOperation] = Field(default_factory=list)
@@ -107,7 +127,13 @@ class CalculationAgent:
                     "instruction": instruction
                 })
             except Exception as e:
-                return AgentResult(status="failed", error_message=f"Failed to generate calculation plan via LLM: {str(e)}")
+                return AgentResult(
+                    status="failed",
+                    error_message=(
+                        "Failed to generate calculation plan via LLM for "
+                        f"instruction={instruction!r}: {e}"
+                    ),
+                )
         else:
             try:
                 # Map legacy/agentic_file parameter formats to CalculationOperationPlan
@@ -138,7 +164,13 @@ class CalculationAgent:
 
                 plan = CalculationOperationPlan(operations=ops_data)
             except Exception as e:
-                return AgentResult(status="failed", error_message=f"Failed to build calculation plan: {str(e)}")
+                return AgentResult(
+                    status="failed",
+                    error_message=(
+                        "Failed to build calculation plan from requested operations "
+                        f"[{_summarize_calc_ops(raw_ops)}]: {e}"
+                    ),
+                )
 
         # Strict parameter validation of final plan operations
         try:
@@ -147,7 +179,13 @@ class CalculationAgent:
                 "operations": plan.operations
             })
         except ValidationError as e:
-            return AgentResult(status="failed", error_message=f"Failed to build calculation plan: Invalid parameter schema for CalculationAgent: {str(e)}")
+            return AgentResult(
+                status="failed",
+                error_message=(
+                    "Failed to validate calculation plan for CalculationAgent "
+                    f"(operation_count={len(plan.operations)}): {e}"
+                ),
+            )
 
         try:
             output = execute_calculation_plan(df.copy(), plan)
@@ -161,4 +199,11 @@ class CalculationAgent:
                 artifacts=output.artifacts
             )
         except Exception as e:
-            return AgentResult(status="failed", error_message=f"Calculation failed: {str(e)}")
+            return AgentResult(
+                status="failed",
+                error_message=(
+                    "Calculation execution failed for operations "
+                    f"[{_summarize_calc_ops(plan.operations)}] on dataframe columns "
+                    f"{list(df.columns)}: {e}"
+                ),
+            )

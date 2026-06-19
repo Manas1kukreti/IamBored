@@ -1,32 +1,4 @@
-"""Filter agent for the FinFlow Agent Service.
-
-Receives a dataframe via the engine's single-source ``input_dataframe`` rule,
-resolves every requested column through the deterministic
-:mod:`finflow_agent.tools.column_resolver`, applies the configured
-``LOW_CONFIDENCE_POLICY`` to any resolution scoring below
-:data:`CONFIDENCE_THRESHOLD`, and finally translates the surviving filter
-conditions into deterministic boolean masks via
-:func:`finflow_agent.operations.executor.execute_filter_plan`.
-
-Security and contract guarantees (acceptance criteria 5.5, 7.6 - 7.9, 11.4,
-11.5, 12.4):
-
-* The agent reads its dataframe **exclusively** from
-  ``input_data["input_dataframe"]`` and returns a controlled failure when
-  the key is missing or ``None``.
-* Filter conditions are typed (``FilterCondition``) and dispatched through
-  ``FILTER_HANDLERS`` boolean-mask functions. No LLM-supplied string is
-  ever forwarded to ``pandas.DataFrame.query`` or any other code-evaluation
-  surface.
-* When the optional Groq path is taken, the LLM uses
-  ``with_structured_output(FilterOperationPlan)`` so the response is a
-  Pydantic-validated plan, never a raw string. The system prompt marks the
-  profile as untrusted data and forbids following instructions inside cell
-  values.
-* Every :class:`ColumnResolution` is published under
-  ``AgentResult.artifacts["column_mapping"]`` so the audit-sheet writer
-  (task 11.x) can render the ``column_mapping`` sheet.
-"""
+"""Filter agent for the FinFlow Agent Service."""
 
 from __future__ import annotations
 
@@ -39,25 +11,23 @@ from pydantic import BaseModel, ValidationError
 from finflow_agent.llm import get_chat_groq
 from finflow_agent.operations.executor import execute_filter_plan
 from finflow_agent.operations.schemas import FilterCondition, FilterOperationPlan
+from finflow_agent.planning.intent_package import (
+    ContractViolation,
+    IntentPackage,
+    PackageStatus,
+)
+from finflow_agent.planning.package_builder import build_intent_package
 from finflow_agent.registry import AgentSpec, registry
 from finflow_agent.state import AgentResult
 from finflow_agent.tools.column_resolver import (
-    CONFIDENCE_THRESHOLD,
     ColumnResolution,
     enforce_low_confidence_policy,
-    resolve_columns,
 )
 from finflow_agent.tools.dataframe_profile import profile_dataframe
+from finflow_agent.tools.value_resolver import resolve_value_domain
 
 
 class FilterAgentParams(BaseModel):
-    """Pydantic params model for the filter agent.
-
-    Lives in the same module as the agent class so the registry can pick
-    it up alongside the spec. The plan validator and the execution engine
-    re-validate ``step.params`` against this model before the agent runs.
-    """
-
     plan: FilterOperationPlan
 
 
@@ -73,48 +43,86 @@ class FilterAgent:
     )
     params_model = FilterAgentParams
 
-    # ------------------------------------------------------------------
-    # Public entry point
-    # ------------------------------------------------------------------
     def execute(self, params: dict, input_data: dict) -> AgentResult:
-        # 1. Single-source input contract (req 5.5, 11.4).
         df = input_data.get("input_dataframe") if input_data else None
         if df is None:
             return AgentResult(
                 status="failed",
-                error_message=(
-                    "input_dataframe is required. No input dataframe provided."
-                ),
+                error_message="input_dataframe is required. No input dataframe provided.",
             )
 
-        # 2. Resolve params -> FilterOperationPlan. The structured path is
-        #    always preferred when ``params["plan"]`` is supplied (which is
-        #    what the compiler emits, task 7.1). The optional LLM path is
-        #    used only when ``GROQ_API_KEY`` and ``instruction`` are set
-        #    and the structured plan is absent.
         plan_or_failure = self._extract_or_build_plan(params, df)
         if isinstance(plan_or_failure, AgentResult):
             return plan_or_failure
         plan: FilterOperationPlan = plan_or_failure
 
-        # 3. Resolve every requested column through the deterministic
-        #    column resolver and apply LOW_CONFIDENCE_POLICY.
-        try:
-            profile = profile_dataframe(df, include_samples=False)
-        except Exception as exc:  # pragma: no cover - defensive
+        intent_package = input_data.get("intent_package")
+        if not isinstance(intent_package, IntentPackage):
+            try:
+                profile = profile_dataframe(df, include_samples=True, sample_rows=5)
+                intent_package = build_intent_package(
+                    submission_id=str(
+                        input_data.get("submission_id")
+                        or input_data.get("job_id")
+                        or "legacy-filter-agent"
+                    ),
+                    filter_plan=plan,
+                    profile=profile,
+                )
+            except Exception as exc:
+                return AgentResult(
+                    status="failed",
+                    error_message=(
+                        "intent_package could not be built from the legacy "
+                        f"filter-agent inputs: {exc}"
+                    ),
+                )
+
+        if intent_package.status == PackageStatus.QUARANTINED:
             return AgentResult(
                 status="failed",
-                error_message=f"Failed to profile dataframe: {exc}",
+                error_message=(
+                    intent_package.quarantine_reason
+                    or "IntentPackage is quarantined."
+                ),
+                artifacts={
+                    "contract_violation": {
+                        "status": "quarantined",
+                        "reason": intent_package.quarantine_reason,
+                        "package_version": intent_package.version_key,
+                    }
+                },
             )
 
-        requested_fields: List[str] = [c.column for c in plan.conditions]
-        resolutions: List[ColumnResolution] = (
-            resolve_columns(requested_fields, profile)
-            if requested_fields and profile.columns
-            else []
+        if intent_package.status == PackageStatus.NEEDS_REVIEW:
+            review_artifact = {
+                "status": intent_package.status.value,
+                "reason": intent_package.grounding_result.reason
+                if intent_package.grounding_result
+                else "Filter grounding requires review.",
+                "package_version": intent_package.version_key,
+                "unresolved_fields": intent_package.unresolved_fields,
+                "grounding_result": (
+                    intent_package.grounding_result.model_dump(mode="json")
+                    if intent_package.grounding_result is not None
+                    else None
+                ),
+            }
+            return AgentResult(
+                status="failed",
+                error_message=(
+                    review_artifact["reason"]
+                    or "Filter grounding requires review before execution."
+                ),
+                artifacts={"needs_review": review_artifact},
+            )
+
+        resolutions, grounding_artifacts = self._build_resolutions(
+            plan=plan,
+            intent_package=intent_package,
         )
         column_mapping_artifact: List[Dict[str, Any]] = [
-            r.model_dump() for r in resolutions
+            resolution.model_dump(mode="json") for resolution in resolutions
         ]
 
         warnings: List[str] = []
@@ -135,8 +143,6 @@ class FilterAgent:
                 skipped.add(idx)
                 continue
             if decision == "fail":
-                # The message names requested_field, matched_column, and
-                # confidence per the resolver contract (req 7.8).
                 return AgentResult(
                     status="failed",
                     error_message=message
@@ -144,14 +150,13 @@ class FilterAgent:
                         f"Low-confidence column match for "
                         f"{resolution.requested_field!r}."
                     ),
-                    artifacts={"column_mapping": column_mapping_artifact},
+                    artifacts={
+                        "column_mapping": column_mapping_artifact,
+                        "predicate_grounding": grounding_artifacts,
+                    },
                     warnings=warnings,
                 )
             if decision == "quarantine":
-                # Signal quarantine to the orchestrator without applying
-                # the offending condition. The status stays in the closed
-                # success/partial/failed set; the quarantine signal lives
-                # in artifacts so the orchestrator can detect it.
                 return AgentResult(
                     status="failed",
                     error_message=message
@@ -161,69 +166,76 @@ class FilterAgent:
                     ),
                     artifacts={
                         "column_mapping": column_mapping_artifact,
+                        "predicate_grounding": grounding_artifacts,
                         "quarantine": {
                             "reason": message,
-                            "resolution": resolution.model_dump(),
+                            "resolution": resolution.model_dump(mode="json"),
                         },
                     },
                     warnings=warnings,
                 )
-            # Defensive fallback for an unknown decision token.
             return AgentResult(
                 status="failed",
                 error_message=(
                     f"Unknown low-confidence policy decision: {decision!r}."
                 ),
-                artifacts={"column_mapping": column_mapping_artifact},
+                artifacts={
+                    "column_mapping": column_mapping_artifact,
+                    "predicate_grounding": grounding_artifacts,
+                },
                 warnings=warnings,
             )
 
-        # 4. Build the effective plan. Skipped conditions are dropped;
-        #    surviving conditions are rewritten to use the resolved
-        #    ``matched_column`` so the deterministic executor always
-        #    indexes the dataframe with a column that actually exists.
         effective_conditions: List[FilterCondition] = []
-        for i, cond in enumerate(plan.conditions):
-            if i in skipped:
+        for idx, cond in enumerate(plan.conditions):
+            if idx in skipped:
                 continue
-            resolution = resolutions[i] if i < len(resolutions) else None
-            target_column = cond.column
-            if (
-                resolution is not None
-                and resolution.matched_column != cond.column
-                and resolution.matched_column in df.columns
-            ):
-                target_column = resolution.matched_column
-            if target_column != cond.column:
-                effective_conditions.append(
-                    cond.model_copy(update={"column": target_column})
+            resolution = resolutions[idx]
+            target_column = resolution.matched_column
+            if target_column not in df.columns:
+                violation = ContractViolation(
+                    step_id="filter",
+                    agent="filter_agent",
+                    violation_type="column_missing",
+                    expected=target_column,
+                    actual=f"columns={list(df.columns)}",
                 )
-            else:
-                effective_conditions.append(cond)
+                intent_package.add_violation(violation)
+                return AgentResult(
+                    status="failed",
+                    error_message=(
+                        f"Contract violation: resolved column {target_column!r} "
+                        f"not found in dataframe. Package quarantined."
+                    ),
+                    artifacts={
+                        "contract_violation": violation.model_dump(mode="json"),
+                        "column_mapping": column_mapping_artifact,
+                        "predicate_grounding": grounding_artifacts,
+                    },
+                    warnings=warnings,
+                )
+            effective_conditions.append(
+                cond.model_copy(update={"column": target_column})
+            )
 
-        effective_plan = plan.model_copy(
-            update={"conditions": effective_conditions}
-        )
+        effective_plan = plan.model_copy(update={"conditions": effective_conditions})
 
-        # 5. Defensive params re-validation.
         try:
             FilterAgentParams.model_validate({"plan": effective_plan})
         except ValidationError as exc:
             return AgentResult(
                 status="failed",
-                error_message=(
-                    f"Invalid parameter schema for FilterAgent: {exc}"
-                ),
-                artifacts={"column_mapping": column_mapping_artifact},
+                error_message=f"Invalid parameter schema for FilterAgent: {exc}",
+                artifacts={
+                    "column_mapping": column_mapping_artifact,
+                    "predicate_grounding": grounding_artifacts,
+                },
                 warnings=warnings,
             )
 
-        # 6. Validate select_columns against the actual dataframe.
         if effective_plan.select_columns:
             missing_cols = [
-                col
-                for col in effective_plan.select_columns
-                if col not in df.columns
+                col for col in effective_plan.select_columns if col not in df.columns
             ]
             if missing_cols:
                 return AgentResult(
@@ -232,29 +244,50 @@ class FilterAgent:
                         "Missing selected columns in dataframe: "
                         + ", ".join(missing_cols)
                     ),
-                    artifacts={"column_mapping": column_mapping_artifact},
+                    artifacts={
+                        "column_mapping": column_mapping_artifact,
+                        "predicate_grounding": grounding_artifacts,
+                    },
                     warnings=warnings,
                 )
 
-        # 7. Translate filter conditions to deterministic boolean masks
-        #    via the typed FILTER_HANDLERS dispatch table. No string is
-        #    ever passed to df.query() or any code-evaluation surface
-        #    (req 12.4).
+        value_resolutions: List[Dict[str, Any]] = []
+        for cond in effective_plan.conditions:
+            resolved_column = cond.column
+            value_resolution = resolve_value_domain(
+                df[resolved_column],
+                cond.value,
+                cond.operator,
+                case_sensitive=cond.case_sensitive,
+            )
+            value_resolutions.append(value_resolution.model_dump(mode="json"))
+
+            if not value_resolution.matched:
+                warnings.append(
+                    f"Requested value {cond.value!r} was not observed in column "
+                    f"{resolved_column!r}; filter may return zero rows."
+                )
+
         try:
             output = execute_filter_plan(df.copy(), effective_plan)
         except Exception as exc:
             return AgentResult(
                 status="failed",
                 error_message=f"Failed to execute filter plan: {exc}",
-                artifacts={"column_mapping": column_mapping_artifact},
+                artifacts={
+                    "column_mapping": column_mapping_artifact,
+                    "predicate_grounding": grounding_artifacts,
+                },
                 warnings=warnings,
             )
 
         merged_warnings = list(warnings) + list(output.warnings or [])
-        merged_artifacts: Dict[str, Any] = (
-            dict(output.artifacts) if output.artifacts else {}
-        )
+        merged_artifacts: Dict[str, Any] = dict(output.artifacts) if output.artifacts else {}
         merged_artifacts["column_mapping"] = column_mapping_artifact
+        if grounding_artifacts:
+            merged_artifacts["predicate_grounding"] = grounding_artifacts
+        if value_resolutions:
+            merged_artifacts["value_resolution"] = value_resolutions
 
         return AgentResult(
             status="success",
@@ -267,28 +300,79 @@ class FilterAgent:
         )
 
     # ------------------------------------------------------------------
-    # Plan resolution
+    # Internal helpers
     # ------------------------------------------------------------------
+    def _build_resolutions(
+        self,
+        *,
+        plan: FilterOperationPlan,
+        intent_package: IntentPackage,
+    ) -> tuple[List[ColumnResolution], List[Dict[str, Any]]]:
+        resolutions: List[ColumnResolution] = []
+        grounding_artifacts: List[Dict[str, Any]] = []
+
+        for cond in plan.conditions:
+            grounded_clause = intent_package.get_grounded_clause(cond.column)
+            resolved_column = intent_package.get_resolved_column(cond.column)
+
+            if grounded_clause is not None:
+                semantic_type = "grounded"
+                if grounded_clause.candidate_scores:
+                    selected_candidate = next(
+                        (
+                            candidate
+                            for candidate in grounded_clause.candidate_scores
+                            if candidate.column == grounded_clause.resolved_column
+                        ),
+                        None,
+                    )
+                    if selected_candidate is not None:
+                        semantic_type = selected_candidate.broad_type.value
+                resolution = ColumnResolution(
+                    requested_field=cond.column,
+                    matched_column=grounded_clause.resolved_column,
+                    semantic_type=semantic_type,
+                    confidence=grounded_clause.confidence,
+                    reason=(
+                        f"semantic grounding ({grounded_clause.grounding_method}): "
+                        + "; ".join(grounded_clause.positive_evidence[:3])
+                    ),
+                )
+                grounding_artifacts.append(grounded_clause.model_dump(mode="json"))
+            elif resolved_column is not None:
+                resolution = ColumnResolution(
+                    requested_field=cond.column,
+                    matched_column=resolved_column.resolved_column,
+                    semantic_type=resolved_column.semantic_type or "unknown",
+                    confidence=resolved_column.confidence,
+                    reason=f"from_intent_package_v{intent_package.version}",
+                )
+            else:
+                violation = ContractViolation(
+                    step_id="filter",
+                    agent="filter_agent",
+                    violation_type="resolution_missing",
+                    expected=cond.column,
+                    actual=(
+                        "package_fields="
+                        f"{[rc.requested_field for rc in intent_package.resolved_columns]}"
+                    ),
+                )
+                intent_package.add_violation(violation)
+                raise ValueError(
+                    f"Contract violation: resolved column for {cond.column!r} "
+                    f"is missing from IntentPackage. Package quarantined."
+                )
+
+            resolutions.append(resolution)
+
+        return resolutions, grounding_artifacts
+
     def _extract_or_build_plan(
         self,
         params: dict,
         df: pd.DataFrame,
     ) -> Union[FilterOperationPlan, AgentResult]:
-        """Resolve ``params`` into a :class:`FilterOperationPlan`.
-
-        Resolution order:
-
-        1. ``params["plan"]`` (the compiler-emitted structured path).
-        2. Optional LLM-driven path when ``GROQ_API_KEY`` and
-           ``params["instruction"]`` are both present. The LLM is bound
-           to ``FilterOperationPlan`` via ``with_structured_output``, so
-           the response is always a Pydantic-validated plan.
-        3. Legacy parameter parsing (``conditions``/``filters`` lists)
-           preserved for back-compatible test fixtures.
-
-        Returns either a ``FilterOperationPlan`` instance or an
-        ``AgentResult`` describing a controlled failure.
-        """
         params = params or {}
 
         plan_data = params.get("plan")
@@ -308,7 +392,6 @@ class FilterAgent:
         if api_key and instruction:
             return self._build_plan_via_llm(df, instruction)
 
-        # Legacy compatibility path.
         return self._build_plan_from_legacy_params(params)
 
     def _build_plan_via_llm(
@@ -334,15 +417,8 @@ class FilterAgent:
         try:
             from langchain_core.prompts import PromptTemplate
 
-            profile = profile_dataframe(df, include_samples=False)
+            profile = profile_dataframe(df, include_samples=True, sample_rows=5)
             structured_llm = llm.with_structured_output(FilterOperationPlan)
-
-            # The structured-output binding guarantees the result is a
-            # Pydantic-validated FilterOperationPlan; no raw string can
-            # leak through to df.query() or any other eval surface.
-            #
-            # The system prompt explicitly marks the profile as untrusted
-            # and forbids following instructions embedded in cell values.
             system_prompt = (
                 "You are a data filtering assistant. You are provided with a\n"
                 "sanitized pandas DataFrame profile and a user instruction.\n"
@@ -361,9 +437,6 @@ class FilterAgent:
 
             prompt = PromptTemplate.from_template(system_prompt)
             chain = prompt | structured_llm
-
-            # ``DataFrameProfile`` is a Pydantic model; its model_dump_json
-            # is the safe serializer (no fallback to ``str()``).
             result = chain.invoke(
                 {
                     "profile": profile.model_dump_json(),
@@ -410,10 +483,8 @@ class FilterAgent:
         try:
             return FilterOperationPlan(
                 conditions=conditions,
-                logic=params.get("logic") or "AND",
-                select_columns=(
-                    params.get("columns") or params.get("select_columns")
-                ),
+                logic=(params.get("logic") or "and").lower(),
+                select_columns=(params.get("columns") or params.get("select_columns")),
                 limit=params.get("limit"),
             )
         except Exception as exc:

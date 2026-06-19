@@ -55,6 +55,21 @@ def test_orchestrator_quarantined_request(mock_call_groq):
     assert res["status"] == "quarantined"
     assert "stock trading" in res["reason"]
 
+
+@patch("finflow_agent.orchestrator.call_groq_json")
+def test_orchestrator_quarantined_request_without_reason_is_explicit(mock_call_groq):
+    orchestrator = Orchestrator()
+
+    mock_call_groq.return_value = {
+        "is_quarantined": True,
+        "quarantine_reason": None,
+    }
+
+    res = orchestrator.build_plan("analyze something unsupported", "test.csv", "test.csv", "xlsx")
+    assert isinstance(res, dict)
+    assert res["status"] == "quarantined"
+    assert "did not provide a quarantine_reason" in res["reason"]
+
 @patch("finflow_agent.orchestrator.call_groq_json")
 def test_orchestrator_quarantines_initial_llm_error_without_blind_retry(mock_call_groq):
     orchestrator = Orchestrator()

@@ -35,17 +35,34 @@ class IngestionAgent:
         except ValidationError as e:
             return AgentResult(
                 status="failed",
-                error_message=f"Invalid parameter schema for IngestionAgent: {str(e)}"
+                error_message=(
+                    "Invalid parameter schema for IngestionAgent "
+                    f"(resolved_file_path={params.get('resolved_file_path')!r}, "
+                    f"file_type={params.get('file_type')!r}): {e}"
+                )
             )
 
         resolved_file_path = validated.resolved_file_path
         file_type = validated.file_type.lower()
 
         if file_type in ["png", "jpg", "jpeg", "gif"]:
-            return AgentResult(status="failed", error_message="Image files are not supported.")
+            return AgentResult(
+                status="failed",
+                error_message=(
+                    f"Image files are not supported by IngestionAgent "
+                    f"(file_type={file_type!r}, path={resolved_file_path!r})."
+                ),
+            )
 
         if file_type not in ["xlsx", "xls", "csv"]:
-            return AgentResult(status="failed", error_message=f"Unsupported file type: {file_type}")
+            return AgentResult(
+                status="failed",
+                error_message=(
+                    "Unsupported file type for IngestionAgent: "
+                    f"file_type={file_type!r}, path={resolved_file_path!r}. "
+                    "Allowed values: 'xlsx', 'xls', 'csv'."
+                ),
+            )
 
         # Path safety: when UPLOAD_DIR is configured, enforce a sandbox boundary
         # so a malformed or malicious upstream cannot make us read files outside
@@ -60,12 +77,21 @@ class IngestionAgent:
             except UnsafeInputPathError as exc:
                 return AgentResult(
                     status="failed",
-                    error_message=f"Unsafe input path: {exc}",
+                    error_message=(
+                        f"Unsafe input path for IngestionAgent: {exc} "
+                        f"(requested_path={resolved_file_path!r}, upload_dir={upload_dir!r})"
+                    ),
                 )
             resolved_file_path = str(safe_path)
         else:
             if not os.path.exists(resolved_file_path):
-                return AgentResult(status="failed", error_message=f"File not found: {resolved_file_path}")
+                return AgentResult(
+                    status="failed",
+                    error_message=(
+                        f"Input file not found for IngestionAgent: "
+                        f"path={resolved_file_path!r}, file_type={file_type!r}"
+                    ),
+                )
 
         try:
             if file_type == "csv":
@@ -90,4 +116,10 @@ class IngestionAgent:
                 }
             )
         except Exception as e:
-            return AgentResult(status="failed", error_message=f"Failed to parse file: {str(e)}")
+            return AgentResult(
+                status="failed",
+                error_message=(
+                    f"Failed to parse input file for IngestionAgent "
+                    f"(file_type={file_type!r}, path={resolved_file_path!r}): {e}"
+                ),
+            )

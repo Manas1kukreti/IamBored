@@ -52,8 +52,12 @@ import pandas as pd
 from langgraph.graph import END, START, StateGraph
 from pydantic import BaseModel, ValidationError
 
+from finflow_agent.planning.intent_package import IntentPackage
+from finflow_agent.planning.package_builder import build_intent_package
+from finflow_agent.operations.schemas import FilterOperationPlan
 from finflow_agent.registry import registry
 from finflow_agent.state import AgentResult, ExecutionPlan, PipelineState
+from finflow_agent.tools.dataframe_profile import profile_dataframe
 
 
 class ExecutionEngine:
@@ -167,6 +171,22 @@ class ExecutionEngine:
                 return inner
         return None
 
+    @staticmethod
+    def _build_intent_package_for_filter_step(
+        *,
+        step,
+        dataframe: pd.DataFrame,
+        submission_id: str,
+    ) -> IntentPackage:
+        """Build the shared IntentPackage once for the filter boundary."""
+        plan = FilterOperationPlan.model_validate(step.params.get("plan"))
+        profile = profile_dataframe(dataframe, include_samples=True, sample_rows=5)
+        return build_intent_package(
+            submission_id=submission_id,
+            filter_plan=plan,
+            profile=profile,
+        )
+
     @classmethod
     def _build_input_data(
         cls,
@@ -237,6 +257,31 @@ class ExecutionEngine:
         if chart_artifacts:
             input_data["chart_artifacts"] = chart_artifacts
 
+        # Build the shared IntentPackage once at the filter boundary when
+        # the caller did not inject one explicitly. This keeps column
+        # resolution centralized and makes the package available to the
+        # filter and reporting agents.
+        if (
+            step.agent == "filter_agent"
+            and "intent_package" not in input_data
+            and "input_dataframe" in input_data
+        ):
+            submission_id = str(state_data.get("__submission_id__", "unknown-submission"))
+            package = cls._build_intent_package_for_filter_step(
+                step=step,
+                dataframe=input_data["input_dataframe"],
+                submission_id=submission_id,
+            )
+            state_data["__intent_package__"] = package
+            input_data["intent_package"] = package
+
+        # Inject the shared IntentPackage when present in state_data.
+        # The engine stores it under "__intent_package__" so it never
+        # collides with step output_keys; agents receive it as
+        # input_data["intent_package"].
+        if "__intent_package__" in state_data:
+            input_data["intent_package"] = state_data["__intent_package__"]
+
         return input_data
 
     # ------------------------------------------------------------------
@@ -263,12 +308,22 @@ class ExecutionEngine:
     # ------------------------------------------------------------------
     # Public entry point
     # ------------------------------------------------------------------
-    def execute(self, plan: ExecutionPlan) -> dict:
+    def execute(
+        self,
+        plan: ExecutionPlan,
+        intent_package: Optional[Any] = None,
+        submission_id: Optional[str] = None,
+    ) -> dict:
         sorted_ids = self._topological_sort(plan)
         self._validate_stages(plan)
 
         self.step_results = {}
         step_dict = {s.step_id: s for s in plan.steps}
+
+        # Store the intent_package in a sentinel key so _build_input_data
+        # can inject it into every agent's input_data dict.
+        self._intent_package = intent_package
+        self._submission_id = submission_id or "unknown-submission"
 
         builder = StateGraph(PipelineState)
 
@@ -416,6 +471,11 @@ class ExecutionEngine:
         start_time = time.time()
         try:
             initial_state = PipelineState()
+            # Seed the intent_package into state.data so _build_input_data
+            # can forward it to every agent's input_data dict.
+            if intent_package is not None:
+                initial_state.data["__intent_package__"] = intent_package
+            initial_state.data["__submission_id__"] = self._submission_id
             graph.invoke(initial_state)
             duration_ms = int((time.time() - start_time) * 1000)
 

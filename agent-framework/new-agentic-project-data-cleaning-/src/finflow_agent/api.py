@@ -40,6 +40,29 @@ class JobPayload(BaseModel):
     output_format: str
 
 
+def _extract_failure_reason(result_payload: dict | None) -> str:
+    if not isinstance(result_payload, dict):
+        return "Job failed without a structured result payload."
+
+    summary = result_payload.get("summary")
+    if isinstance(summary, dict):
+        failed_step_id = summary.get("failed_step_id")
+        for key in ("error_message", "error", "reason"):
+            raw = summary.get(key)
+            if raw:
+                prefix = (
+                    f"Step '{failed_step_id}' failed: "
+                    if failed_step_id and str(raw) not in str(failed_step_id)
+                    else ""
+                )
+                return prefix + str(raw)
+
+    status_value = result_payload.get("status")
+    if status_value:
+        return f"Job ended with status {status_value!r} without a detailed failure reason."
+    return "Job failed without a detailed failure reason."
+
+
 def _attach_callback_identity(result_payload: dict, *, job_id: str, submission_id: str) -> dict:
     result_payload["submission_id"] = submission_id
     result_payload["job_id"] = job_id
@@ -128,13 +151,17 @@ async def process_job_task(ctx, payload_dict: dict):
         )
         
         engine = ExecutionEngine()
-        result_payload = engine.execute(plan_or_dict)
+        result_payload = engine.execute(
+            plan_or_dict,
+            submission_id=submission_id,
+        )
         _attach_callback_identity(result_payload, job_id=job_id, submission_id=submission_id)
         
         if result_payload.get("status") != "complete":
+            failure_reason = _extract_failure_reason(result_payload)
             await repository.mark_failed(
                 job_id,
-                json.dumps(result_payload.get("summary", {}), default=str)
+                failure_reason,
             )
         else:
             output_path = result_payload.get("output_path")
@@ -144,21 +171,35 @@ async def process_job_task(ctx, payload_dict: dict):
                     "status": "failed",
                     "output_path": None,
                     "summary": {
-                        "error": "Complete job missing output_path",
+                        "error": (
+                            "Execution completed but reporting output was missing "
+                            "primary output_path."
+                        ),
+                        "error_message": (
+                            "Execution completed but reporting output was missing "
+                            "primary output_path."
+                        ),
                         "engine_result": result_payload
                     }
                 }
                 _attach_callback_identity(result_payload, job_id=job_id, submission_id=submission_id)
-                await repository.mark_failed(job_id, "Complete job missing output_path")
+                await repository.mark_failed(
+                    job_id,
+                    "Execution completed but reporting output was missing primary output_path.",
+                )
             else:
                 await repository.mark_succeeded(job_id, result_payload)
     except Exception as e:
-        await repository.mark_failed(job_id, str(e))
+        error_message = f"Unhandled worker exception while processing job: {e}"
+        await repository.mark_failed(job_id, error_message)
         result_payload = {
             "submission_id": submission_id,
             "status": "failed",
             "output_path": None,
-            "summary": {"error": str(e)}
+            "summary": {
+                "error": error_message,
+                "error_message": error_message,
+            }
         }
         _attach_callback_identity(result_payload, job_id=job_id, submission_id=submission_id)
 

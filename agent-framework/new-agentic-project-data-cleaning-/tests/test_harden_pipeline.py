@@ -57,6 +57,7 @@ def test_plan_with_invalid_params_is_rejected():
     res = agent.execute({"operations": [{"type": "group_sum", "column": "Val"}]}, {"input_dataframe": pd.DataFrame({"Val": [1]})})
     assert res.status == "failed"
     assert "Failed to build calculation plan" in res.error_message
+    assert "group_sum(column=Val)" in res.error_message
 
 def test_cycle_plan_is_rejected():
     plan = ExecutionPlan(steps=[
@@ -124,6 +125,32 @@ def test_calculation_agent_does_not_scan_global_state():
     res = agent.execute({"operations": []}, {})
     assert res.status == "failed"
     assert "No input dataframe provided" in res.error_message
+
+
+def test_cleaning_agent_execute_failure_surfaces_operation_and_columns(monkeypatch):
+    from finflow_agent.agents.cleaning_agent import CleaningAgent
+    from finflow_agent.operations.schemas import CleaningOperationPlan, NormalizeColumnNamesOperation
+
+    def boom(df, plan):
+        raise RuntimeError("simulated cleaning executor failure")
+
+    monkeypatch.setattr(
+        "finflow_agent.agents.cleaning_agent.execute_cleaning_plan",
+        boom,
+    )
+
+    agent = CleaningAgent()
+    plan = CleaningOperationPlan(
+        operations=[NormalizeColumnNamesOperation(style="snake_case")]
+    )
+    df = pd.DataFrame({"Order ID": [1]})
+
+    res = agent.execute({"plan": plan.model_dump(mode="json")}, {"input_dataframe": df})
+
+    assert res.status == "failed"
+    assert "simulated cleaning executor failure" in res.error_message
+    assert "normalize_column_names" in res.error_message.lower()
+    assert "Order ID" in res.error_message
 
 def test_missing_column_fails():
     from finflow_agent.operations.executor import execute_calculation_plan
@@ -554,11 +581,13 @@ async def test_callback_failure_marks_callback_failed():
     repo._write_db(db)
     
     # Force httpx callback to throw request error immediately
+    os.environ["AGENT_CALLBACK_SECRET"] = "test-secret"
     with patch("httpx.AsyncClient.post", side_effect=Exception("Connection refused")):
         await send_backend_callback({}, job_id, repo)
         
     job = await repo.get_job(job_id)
     assert job["status"] == "CALLBACK_FAILED"
+    assert "Backend callback request error" in job["error"]
 
 
 def test_callback_payload_serializer_handles_dataframe_profile():
@@ -590,6 +619,18 @@ def test_callback_payload_serializer_handles_dataframe_profile():
         safe_payload["summary"]["agent_summaries"][0]["metrics"]["profile"],
         dict,
     )
+
+
+def test_callback_failure_persists_clear_error_reason():
+    from finflow_agent.jobs.repository import JobRepository
+
+    repo = JobRepository()
+    job_id = "agent:cb_fail_test"
+    job = repo._read_db()[job_id]
+
+    assert job["status"] == "CALLBACK_FAILED"
+    assert job["error"] is not None
+    assert "Backend callback request error" in job["error"] or "Backend callback rejected payload" in job["error"]
 
 
 def test_callback_identity_is_stable_for_same_payload():
@@ -812,7 +853,7 @@ async def test_send_backend_callback_posts_json_safe_payload_with_dataframe_prof
         text = "ok"
 
     class FakeRepository:
-        async def mark_callback_failed(self, job_id):
+        async def mark_callback_failed(self, job_id, error_msg=None):
             raise AssertionError("callback should not be marked failed")
 
     async def fake_post(self, url, json, headers):
@@ -1271,7 +1312,3 @@ def test_bootstrap_agents_does_not_require_langchain_groq_at_import_time():
     # Restore original sys.modules states for LLM modules
     for mod, val in original_llm_states.items():
         sys.modules[mod] = val
-
-
-
-
