@@ -48,7 +48,6 @@ LowConfidencePolicy = Literal["warn", "fail", "quarantine"]
 DEFAULT_ENABLE_VISUALIZATION: bool = False
 DEFAULT_LOW_CONFIDENCE_POLICY: LowConfidencePolicy = "fail"
 DEFAULT_CONFIDENCE_THRESHOLD: float = 0.75
-
 ALLOWED_LOW_CONFIDENCE_POLICIES: tuple[LowConfidencePolicy, ...] = (
     "warn",
     "fail",

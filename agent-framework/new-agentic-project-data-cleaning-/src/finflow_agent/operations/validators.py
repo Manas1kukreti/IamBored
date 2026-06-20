@@ -35,16 +35,19 @@ def required_columns_for_operation(op) -> List[str]:
     required = []
 
     if hasattr(op, "column") and getattr(op, "column"):
-        if op.column not in {"__all_string_columns__", "__all_numeric_columns__"}:
+        if isinstance(op.column, str) and op.column in {"__all_string_columns__", "__all_numeric_columns__"}:
+            pass
+        else:
             required.append(op.column)
 
     if hasattr(op, "columns"):
         cols = op.columns
-        if cols not in {"__all_string_columns__", "__all_numeric_columns__"}:
-            if isinstance(cols, str):
-                required.append(cols)
-            elif isinstance(cols, list):
-                required.extend(cols)
+        if isinstance(cols, str) and cols in {"__all_string_columns__", "__all_numeric_columns__"}:
+            pass
+        elif isinstance(cols, str):
+            required.append(cols)
+        elif isinstance(cols, list):
+            required.extend(cols)
 
     if hasattr(op, "group_by") and op.group_by:
         required.extend(op.group_by)

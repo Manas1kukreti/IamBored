@@ -8,8 +8,9 @@ from typing import Any
 import pandas as pd
 
 from app.services.json_safety import make_json_safe
+from app.services.action_schema import action_schema_to_constraints
+from app.services.canonical_intent import build_capability_snapshot, build_canonical_intent, canonical_intent_to_legacy_action_schema
 from app.services.rule_engine import build_validation_warnings
-from app.services.rule_extractor import extract_prompt_constraints, infer_semantic_constraints, merge_constraints
 from app.services.semantic_schema import canonical_target_for_column
 from app.services.rule_types import SEMANTIC_HINTS
 
@@ -56,29 +57,49 @@ def build_schema_proposal_from_file(
     records = _records_from_frame(frame)
     source_columns = [str(column) for column in frame.columns]
     proposed_fields = [_build_field_mapping(column, detected_types.get(str(column), "string")) for column in source_columns]
-    prompt_constraints = extract_prompt_constraints(source_columns, records, instruction)
-    inferred_constraints = infer_semantic_constraints(source_columns, records, instruction)
-    effective_constraints = merge_constraints(prompt_constraints, inferred_constraints)
-    validation_warnings = build_validation_warnings(frame, effective_constraints)
+    canonical_intent = build_canonical_intent(
+        source_columns,
+        records,
+        instruction,
+        output_format="xlsx",
+        detected_types=detected_types,
+        capability_snapshot=build_capability_snapshot(),
+    )
+    canonical_constraints = action_schema_to_constraints(
+        canonical_intent_to_legacy_action_schema(
+            canonical_intent
+        )
+    )
+    validation_warnings = build_validation_warnings(frame, canonical_constraints)
+    legacy_action_schema = canonical_intent_to_legacy_action_schema(canonical_intent)
 
     proposal = {
         "status": "awaiting_schema_approval",
         "requires_user_approval": True,
         "schema_kind": "tabular",
+        "original_prompt": instruction,
+        "normalized_prompt": canonical_intent.get("normalized_prompt", ""),
         "source_columns": source_columns,
         "proposed_fields": proposed_fields,
         "detected_types": detected_types,
         "preview_rows": records,
         "preview_row_count": len(records),
         "total_rows": total_rows,
+        "canonical_intent": canonical_intent,
+        "intent_validation": {
+            "status": canonical_intent.get("resolution_status", "needs_clarification"),
+            "decision": canonical_intent.get("decision", ""),
+            "evidence": canonical_intent.get("evidence", []),
+            "alternatives_considered": canonical_intent.get("alternatives_considered", []),
+            "repair_notes": canonical_intent.get("repair_notes", []),
+            "assumptions": canonical_intent.get("assumptions", []),
+        },
         "action_schema": {
-            "actions": [],
-            "required_capabilities": [],
-            "optional_hints": {"source": "deferred_to_agent_parser"},
+            **legacy_action_schema,
+            "optional_hints": {"source": "deferred_to_agent_parser", "canonical_intent_version": canonical_intent.get("schema_version", "2.0")},
             "source": "deferred_to_agent_parser",
         },
-        "suggested_constraints": effective_constraints,
-        "prompt_constraints": prompt_constraints,
+        "suggested_constraints": canonical_constraints,
         "validation_warnings": validation_warnings,
         "suggestion": _build_suggestion(validation_warnings),
     }

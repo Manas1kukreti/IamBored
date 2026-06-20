@@ -1,5 +1,5 @@
-"""Deterministic compiler that turns a validated ``PlanIntent`` into a
-fixed-shape ``ExecutionPlan``.
+"""Deterministic compiler that turns validated intent into a fixed-shape
+``ExecutionPlan``.
 
 This compiler is the single source of truth for the canonical pipeline shape
 described by the agent-pipeline-hardening spec (Component 6). It enforces:
@@ -28,9 +28,35 @@ Requirements satisfied: 2.1, 2.2, 2.3, 2.4, 2.5, 2.6, 2.7, 2.8, 2.9, 2.10,
 
 from __future__ import annotations
 
+from datetime import datetime
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+import pandas as pd
+
 from finflow_agent.agents.visualization_agent import VISUALIZATION_DISABLED_MESSAGE
+from finflow_agent.operations.schemas import (
+    CleaningOperationPlan,
+    DropDuplicatesOperation,
+    FilterCondition,
+    FilterOperationPlan,
+    NormalizeColumnNamesOperation,
+    TrimWhitespaceOperation,
+)
+from finflow_agent.planning.canonical_intent import (
+    CANONICAL_INTENT_SCHEMA_VERSION,
+    CanonicalIntent,
+    CalculateIntent,
+    CleanIntent,
+    DropColumnsIntent,
+    FilterRowsIntent,
+    LimitRowsIntent,
+    ProjectColumnsIntent,
+    ReportIntent,
+    SortRowsIntent,
+    VisualizeIntent,
+    UnresolvedColumnReference,
+)
 from finflow_agent.planning.intent_schema import PlanIntent
 from finflow_agent.state import ExecutionPlan, PlanStep
 from finflow_agent.tools.config import get_enable_visualization
@@ -394,6 +420,270 @@ def compile_intent_to_plan(
     _assert_filter_input_from(plan.steps)
 
     return plan
+
+
+def compile_canonical_intent(
+    intent: CanonicalIntent,
+    *,
+    resolved_file_path: str,
+    file_type: str,
+    output_dir: str,
+    artifact_prefix: str,
+) -> ExecutionPlan:
+    """Compile a validated ``CanonicalIntent`` into an ``ExecutionPlan``.
+
+    This is the production entrypoint for worker-side execution planning.
+    It does not accept raw prompts or free-form dicts.
+    """
+    _validate_canonical_intent(intent)
+    plan_intent = _canonical_intent_to_plan_intent(
+        intent,
+        resolved_file_path=resolved_file_path,
+        file_type=file_type,
+        output_dir=output_dir,
+        artifact_prefix=artifact_prefix,
+    )
+    return compile_intent_to_plan(
+        intent=plan_intent,
+        resolved_file_path=resolved_file_path,
+        file_type=file_type,
+        output_dir=output_dir,
+        file_prefix=artifact_prefix,
+    )
+
+
+def _validate_canonical_intent(intent: CanonicalIntent) -> None:
+    if intent.schema_version != CANONICAL_INTENT_SCHEMA_VERSION:
+        raise ValueError(
+            f"Unsupported canonical intent schema_version {intent.schema_version!r}; "
+            f"expected {CANONICAL_INTENT_SCHEMA_VERSION!r}."
+        )
+    if intent.output_format not in {"xlsx", "csv", "json", "txt"}:
+        raise ValueError(f"Unsupported output_format {intent.output_format!r}.")
+    if intent.resolution_status not in {"resolved", "repaired"}:
+        raise ValueError(
+            f"Canonical intent resolution_status {intent.resolution_status!r} is not executable."
+        )
+    if not intent.actions:
+        raise ValueError("Canonical intent contains no executable actions.")
+
+
+def _canonical_intent_to_plan_intent(
+    intent: CanonicalIntent,
+    *,
+    resolved_file_path: str,
+    file_type: str,
+    output_dir: str,
+    artifact_prefix: str,
+) -> PlanIntent:
+    source_columns = _source_columns_from_intent(intent, resolved_file_path)
+
+    cleaning_plan: CleaningOperationPlan | None = None
+    filter_plan: FilterOperationPlan | None = None
+    needs_cleaning = False
+    needs_filtering = False
+    needs_calculation = False
+    needs_visualization = False
+
+    selected_columns: list[str] = []
+    filter_conditions: list[FilterCondition] = []
+    filter_logic = "and"
+    filter_limit: int | None = None
+    drop_columns_seen = False
+
+    for action in intent.actions:
+        if isinstance(action, CleanIntent):
+            cleaning_plan = _build_cleaning_plan(action)
+            needs_cleaning = True
+            continue
+
+        if isinstance(action, ProjectColumnsIntent):
+            selected_columns = _resolve_requested_columns(action.requested_fields)
+            needs_filtering = True
+            continue
+
+        if isinstance(action, DropColumnsIntent):
+            drop_columns_seen = True
+            if not source_columns:
+                raise ValueError("drop_columns canonical intent requires source columns in the dataframe profile.")
+            dropped = _resolve_requested_columns(action.requested_fields)
+            selected_columns = [column for column in source_columns if column not in set(dropped)]
+            needs_filtering = True
+            continue
+
+        if isinstance(action, FilterRowsIntent):
+            filter_logic = action.logic
+            needs_filtering = True
+            filter_conditions.extend(_canonical_filter_conditions(action.conditions, action.mode))
+            continue
+
+        if isinstance(action, LimitRowsIntent):
+            filter_limit = max(0, int(action.limit))
+            needs_filtering = True
+            continue
+
+        if isinstance(action, SortRowsIntent):
+            raise ValueError("Canonical sort_rows intent is not supported by the current compiler.")
+        if isinstance(action, CalculateIntent):
+            needs_calculation = True
+            raise ValueError("Canonical calculate intent is not supported by the current compiler.")
+        if isinstance(action, VisualizeIntent):
+            needs_visualization = True
+            raise ValueError("Canonical visualize intent is not supported by the current compiler.")
+        if isinstance(action, ReportIntent):
+            continue
+
+        raise ValueError(f"Unsupported canonical intent action kind: {getattr(action, 'kind', type(action).__name__)}")
+
+    if drop_columns_seen and not source_columns:
+        raise ValueError("drop_columns canonical intent cannot be compiled without source columns.")
+
+    if selected_columns or filter_conditions or filter_limit is not None:
+        filter_plan = FilterOperationPlan(
+            conditions=filter_conditions,
+            logic=filter_logic,
+            select_columns=selected_columns or None,
+            limit=filter_limit,
+        )
+        needs_filtering = True
+
+    return PlanIntent(
+        needs_cleaning=needs_cleaning,
+        needs_filtering=needs_filtering,
+        needs_calculation=needs_calculation,
+        needs_visualization=needs_visualization,
+        output_format=intent.output_format,
+        cleaning_plan=cleaning_plan,
+        filter_plan=filter_plan,
+        reporting_title=intent.decision or None,
+        sheet_name=None,
+    )
+
+
+def _source_columns_from_intent(intent: CanonicalIntent, resolved_file_path: str) -> list[str]:
+    profile_columns = intent.dataframe_profile.get("source_columns")
+    if isinstance(profile_columns, list):
+        columns = [str(column).strip() for column in profile_columns if str(column).strip()]
+        if columns:
+            return columns
+
+    path = Path(str(resolved_file_path))
+    if not path.exists():
+        return []
+
+    extension = path.suffix.lower()
+    try:
+        if extension in {".csv", ".tsv"}:
+            frame = pd.read_csv(path, nrows=0, sep="\t" if extension == ".tsv" else ",")
+        elif extension in {".xlsx", ".xls"}:
+            frame = pd.read_excel(path, nrows=0)
+        else:
+            return []
+        return [str(column).strip() for column in frame.columns if str(column).strip()]
+    except Exception:
+        return []
+
+
+def _resolve_requested_columns(fields: list[UnresolvedColumnReference]) -> list[str]:
+    resolved: list[str] = []
+    for field in fields:
+        resolved.extend(_resolve_field_columns(field))
+    return list(dict.fromkeys(resolved))
+
+
+def _resolve_field_columns(field: UnresolvedColumnReference) -> list[str]:
+    if field.resolved_columns:
+        columns = [str(column).strip() for column in field.resolved_columns if str(column).strip()]
+        if columns:
+            return columns
+
+    column = str(field.resolved_column or "").strip()
+    if column:
+        return [column]
+
+    candidates = [str(column).strip() for column in field.candidate_columns if str(column).strip()]
+    detail = f"selection_mode={field.selection_mode!r}"
+    if candidates:
+        detail += f", candidates={candidates!r}"
+    raise ValueError(f"Unresolved canonical column reference: {field.raw_reference!r} ({detail})")
+
+
+def _build_cleaning_plan(action: CleanIntent) -> CleaningOperationPlan:
+    if not action.operations:
+        return CleaningOperationPlan(
+            operations=[
+                TrimWhitespaceOperation(columns="__all_string_columns__"),
+                NormalizeColumnNamesOperation(style="snake_case"),
+                DropDuplicatesOperation(subset=None, keep="first"),
+            ]
+        )
+
+    operations: list[Any] = []
+    for operation in action.operations:
+        name = operation.name.strip()
+        if name == "trim_whitespace":
+            operations.append(TrimWhitespaceOperation(columns="__all_string_columns__"))
+        elif name == "normalize_column_names":
+            operations.append(NormalizeColumnNamesOperation(style="snake_case"))
+        elif name == "drop_duplicates":
+            operations.append(DropDuplicatesOperation(subset=None, keep="first"))
+        else:
+            raise ValueError(f"Unsupported canonical cleaning operation: {name!r}")
+    return CleaningOperationPlan(operations=operations)
+
+
+def _canonical_filter_conditions(
+    conditions: list[FilterCondition],
+    mode: str,
+) -> list[FilterCondition]:
+    if mode == "keep":
+        return [
+            FilterCondition(
+                column=_resolve_single_grounded_column(condition.field),
+                operator=condition.operator,
+                value=condition.value,
+            )
+            for condition in conditions
+        ]
+
+    inverted: list[FilterCondition] = []
+    for condition in conditions:
+        operator = _invert_operator(condition.operator)
+        inverted.append(
+            FilterCondition(
+                column=_resolve_single_grounded_column(condition.field),
+                operator=operator,
+                value=condition.value,
+            )
+        )
+    return inverted
+
+
+def _resolve_single_grounded_column(field: UnresolvedColumnReference) -> str:
+    column = str(field.resolved_column or "").strip()
+    if column:
+        return column
+    if field.resolved_columns:
+        raise ValueError(
+            f"Canonical filter field {field.raw_reference!r} resolved to multiple columns {field.resolved_columns!r}; "
+            "filter conditions require a single grounded column."
+        )
+    raise ValueError(f"Unresolved canonical filter field: {field.raw_reference!r}")
+
+
+def _invert_operator(operator: str) -> str:
+    mapping = {
+        "eq": "neq",
+        "neq": "eq",
+        "gt": "lte",
+        "gte": "lt",
+        "lt": "gte",
+        "lte": "gt",
+        "contains": "not_contains",
+    }
+    if operator not in mapping:
+        raise ValueError(f"Unsupported operator for drop-mode canonical intent: {operator!r}")
+    return mapping[operator]
 
 
 __all__ = [

@@ -1,3 +1,5 @@
+import os
+
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
@@ -11,6 +13,13 @@ from app.db.session import AsyncSessionLocal, get_db
 from app.models import User, UserRole
 from app.services.request_security import is_origin_allowed
 from app.services.agent_dispatcher import start_dispatcher, stop_dispatcher
+from app.services.canonical_intent import (
+    CANONICAL_INTENT_CAPABILITY_VERSION,
+    CANONICAL_INTENT_SCHEMA_VERSION,
+    INTENT_EXTRACTOR_VERSION,
+    INTENT_GROUNDING_VERSION,
+    INTENT_NORMALIZER_VERSION,
+)
 from starlette.formparsers import MultiPartParser
 from fastapi import Depends
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -144,8 +153,16 @@ async def health(db: AsyncSession = Depends(get_db)) -> dict[str, str | int | bo
     payload: dict[str, str | int | bool | float] = {
         "status": "ok",
         "version": app.version,
+        "git_commit": os.environ.get("GIT_COMMIT", "unknown"),
         "uptime_seconds": round(time.time() - START_TIME, 2),
-        "environment": getattr(settings, "environment", "development")
+        "environment": getattr(settings, "environment", "development"),
+        "canonical_intent_schema_version": CANONICAL_INTENT_SCHEMA_VERSION,
+        "capability_version": CANONICAL_INTENT_CAPABILITY_VERSION,
+        "intent_extractor_version": INTENT_EXTRACTOR_VERSION,
+        "intent_normalizer_version": INTENT_NORMALIZER_VERSION,
+        "intent_grounding_version": INTENT_GROUNDING_VERSION,
+        "compiler_version": "1.0",
+        "standalone_agent_planning_enabled": False,
     }
 
     try:
@@ -177,4 +194,3 @@ async def health(db: AsyncSession = Depends(get_db)) -> dict[str, str | int | bo
             await redis.aclose()
 
     return payload
-

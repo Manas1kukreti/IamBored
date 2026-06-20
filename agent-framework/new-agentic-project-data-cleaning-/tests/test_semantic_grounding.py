@@ -91,11 +91,49 @@ def test_predicate_grounder_llm_fallback_is_independent_of_column_resolution_gat
     monkeypatch.setenv("ENABLE_LLM_PREDICATE_GROUNDING", "true")
     monkeypatch.setenv("GROQ_API_KEY", "fake-key")
 
+    mocked_scores = {
+        "alpha": GroundingCandidate(
+            column="alpha",
+            score=0.41,
+            broad_type=BroadSemanticType.free_text,
+            positive_evidence=["synthetic ambiguous candidate"],
+            negative_evidence=[],
+            semantic_tags=["alpha"],
+        ),
+        "beta": GroundingCandidate(
+            column="beta",
+            score=0.36,
+            broad_type=BroadSemanticType.free_text,
+            positive_evidence=["synthetic runner-up"],
+            negative_evidence=[],
+            semantic_tags=["beta"],
+        ),
+        "gamma": GroundingCandidate(
+            column="gamma",
+            score=0.11,
+            broad_type=BroadSemanticType.free_text,
+            positive_evidence=["synthetic low score"],
+            negative_evidence=[],
+            semantic_tags=["gamma"],
+        ),
+        "delta": GroundingCandidate(
+            column="delta",
+            score=0.09,
+            broad_type=BroadSemanticType.free_text,
+            positive_evidence=["synthetic low score"],
+            negative_evidence=[],
+            semantic_tags=["delta"],
+        ),
+    }
+
     with patch(
+        "finflow_agent.tools.predicate_grounder._score_candidate",
+        side_effect=lambda clause, semantic: mocked_scores[semantic.column],
+    ), patch(
         "finflow_agent.tools.predicate_grounder._llm_ground_clause",
         return_value=LLMGroundingDecision(
-            selected_column="delta",
-            reason="status-like values",
+            selected_column="beta",
+            reason="explicit bounded fallback selection",
             confidence=0.91,
         ),
     ) as mock_llm_fallback:
@@ -113,7 +151,7 @@ def test_predicate_grounder_llm_fallback_is_independent_of_column_resolution_gat
 
     mock_llm_fallback.assert_called_once()
     assert result.status == "grounded"
-    assert result.grounded_clauses[0].resolved_column == "delta"
+    assert result.grounded_clauses[0].resolved_column == "beta"
     assert result.grounded_clauses[0].grounding_method == "llm"
 
 

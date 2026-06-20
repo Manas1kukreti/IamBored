@@ -62,9 +62,9 @@ FastAPI backend
 3. **Schema Proposal Phase**: The backend extracts a data sample and uses semantic analysis (powered by Llama-3.3-70B via `semantic_schema.py`) to infer semantic constraints and roles, building a schema proposal. 
 4. The job enters `awaiting_schema_approval`, pausing execution.
 5. The user reviews the proposed rules (e.g. non-negative numeric ranges, forbidden substrings) and clicks Approve.
-6. The backend parses intent using `action_schema.py` and creates an `ActionSchema`.
-7. The backend enqueues the submission id into Redis, along with the explicitly approved `ActionSchema` containing structural conditions and declarative policies.
-8. The agent service consumes the queue item, runs the exact approved schema via its execution engine and intent parser, handling any robust data recovery (e.g. PDF tables via `table_recovery`), and generates an output artifact in the requested format.
+6. The backend first builds a `CanonicalIntent` in `canonical_intent.py`, then derives the legacy `ActionSchema` view for compatibility.
+7. The backend enqueues the submission id into Redis, along with the approved canonical intent and its compatibility action schema.
+8. The agent service consumes the queue item, runs the validated plan derived from the canonical intent via its execution engine, handling any robust data recovery (e.g. PDF tables via `table_recovery`), and generates an output artifact in the requested format.
 9. The agent service posts the generated file back to `POST /api/agent/callback` as `multipart/form-data`.
 10. The backend stores the output file in its local `/app/storage/outputs` directory, updates status to `complete`, and emits live refresh events.
 11. The frontend fetches job details and the user can download the generated file securely.
@@ -154,6 +154,7 @@ backend/app/
   models.py
   schemas.py
   services/
+    canonical_intent.py
     action_schema.py
     structured_output.py
     semantic_schema.py

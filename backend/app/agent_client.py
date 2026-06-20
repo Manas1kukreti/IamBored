@@ -50,6 +50,7 @@ async def dispatch_to_agent(
     user_id: str | None = None,
     preferred_agent: str | None = None,
     action_schema: str | None = None,
+    canonical_intent: dict | None = None,
 ) -> str:
     settings = get_settings()
     source_path = Path(file_path)
@@ -60,8 +61,9 @@ async def dispatch_to_agent(
         "submission_id": submission_id,
         "file_path": file_path,
         "file_name": source_path.name,
-        "instruction": instruction,
+        "resolved_file_path": file_path,
         "output_format": output_format,
+        "canonical_intent": canonical_intent,
     }
 
     attempted_endpoints: list[str] = []

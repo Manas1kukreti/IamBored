@@ -3,10 +3,11 @@ import json
 import httpx
 import hashlib
 import logging
+from pathlib import Path
 from contextlib import asynccontextmanager
+from typing import Any
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
-from finflow_agent.orchestrator import Orchestrator
 from finflow_agent.engine import ExecutionEngine
 from finflow_agent.registry import registry
 from finflow_agent.bootstrap import bootstrap_agents, validate_required_agents_registered
@@ -14,6 +15,9 @@ from arq import create_pool
 from arq.connections import RedisSettings
 from finflow_agent.jobs.repository import JobRepository
 from finflow_agent.storage.file_store import FileStore
+from finflow_agent.planning.canonical_intent import CanonicalIntentEnvelope
+from finflow_agent.planning.canonical_intent import compute_intent_hash, upcast_canonical_intent_payload
+from finflow_agent.planning.compiler import compile_canonical_intent
 
 
 logger = logging.getLogger(__name__)
@@ -36,8 +40,10 @@ class JobPayload(BaseModel):
     submission_id: str
     file_id: str
     file_name: str
-    instruction: str
+    resolved_file_path: str | None = None
+    canonical_intent: CanonicalIntentEnvelope | None = None
     output_format: str
+    audit_context: dict[str, Any] | None = None
 
 
 def _extract_failure_reason(result_payload: dict | None) -> str:
@@ -80,16 +86,26 @@ def _attach_callback_identity(result_payload: dict, *, job_id: str, submission_i
 
 
 async def process_job_task(ctx, payload_dict: dict):
-    submission_id = payload_dict["submission_id"]
+    try:
+        payload = JobPayload.model_validate(payload_dict)
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f"Invalid job payload: {exc}") from exc
+
+    submission_id = payload.submission_id
     job_id = f"agent:{submission_id}"
     
     repository = (ctx or {}).get("repository") or JobRepository()
     await repository.mark_planning(job_id)
     
-    # Resolve file_id through FileStore inside the worker task
+    # Resolve the file path from the canonical transport payload first.
     try:
-        store = (ctx or {}).get("file_store") or FileStore()
-        resolved_path = store.resolve_uploaded_file(payload_dict["file_id"])
+        if payload.resolved_file_path:
+            resolved_path = Path(payload.resolved_file_path)
+            if not resolved_path.exists():
+                raise FileNotFoundError(f"Resolved file path does not exist: {resolved_path}")
+        else:
+            store = (ctx or {}).get("file_store") or FileStore()
+            resolved_path = store.resolve_uploaded_file(payload.file_id)
         resolved_file_path = str(resolved_path)
     except Exception as e:
         reason = f"File store resolution failed: {str(e)}"
@@ -109,21 +125,71 @@ async def process_job_task(ctx, payload_dict: dict):
     from uuid import uuid4
     file_prefix = f"submission_{submission_id}_{uuid4().hex[:8]}"
 
-    orchestrator = Orchestrator()
-    plan_or_dict = orchestrator.build_plan(
-        instruction=payload_dict["instruction"],
-        file_path=resolved_file_path,
-        file_name=payload_dict["file_name"],
-        output_format=payload_dict["output_format"],
-        output_dir=os.environ.get("OUTPUT_DIR", "outputs"),
-        file_prefix=file_prefix,
-        job_id=job_id,
-        submission_id=submission_id,
-    )
+    plan_or_dict = None
+    if payload.canonical_intent is not None:
+        try:
+            canonical_payload = upcast_canonical_intent_payload(payload.canonical_intent.model_dump(mode="json"))
+            if canonical_payload is None:
+                raise ValueError("Canonical intent payload is missing")
+            payload.canonical_intent = CanonicalIntentEnvelope.model_validate(canonical_payload)
+            logger.info(
+                "event=canonical_job_started job_id=%s submission_id=%s intent_schema_version=%s",
+                job_id,
+                submission_id,
+                payload.canonical_intent.intent.schema_version,
+            )
+            plan_or_dict = compile_canonical_intent(
+                payload.canonical_intent.intent,
+                resolved_file_path=resolved_file_path,
+                file_type=Path(resolved_file_path).suffix.lstrip(".").lower(),
+                output_dir=os.environ.get("OUTPUT_DIR", "outputs"),
+                artifact_prefix=file_prefix,
+            )
+            if isinstance(plan_or_dict, dict):
+                plan_or_dict.setdefault("plan_metadata", {})
+                plan_or_dict["plan_metadata"].update(
+                    {
+                        "intent_id": payload.canonical_intent.intent_id,
+                        "intent_revision": payload.canonical_intent.intent_revision,
+                        "intent_hash": payload.canonical_intent.intent_hash or compute_intent_hash(payload.canonical_intent.intent),
+                        "compiler_version": "1.0",
+                    }
+                )
+            logger.info(
+                "event=canonical_job_compiled job_id=%s submission_id=%s",
+                job_id,
+                submission_id,
+            )
+        except Exception as exc:
+            reason = f"Canonical intent compilation failed: {exc}"
+            await repository.mark_quarantined(job_id, reason)
+            result_payload = {
+                "submission_id": submission_id,
+                "status": "quarantined",
+                "output_path": None,
+                "summary": {"reason": reason},
+            }
+            _attach_callback_identity(result_payload, job_id=job_id, submission_id=submission_id)
+            from finflow_agent.jobs.callbacks import send_backend_callback
+            await send_backend_callback(result_payload, job_id, repository)
+            return
+    else:
+        reason = "legacy_payload_not_supported: canonical_intent is required for execution."
+        await repository.mark_quarantined(job_id, reason)
+        result_payload = {
+            "submission_id": submission_id,
+            "status": "quarantined",
+            "output_path": None,
+            "summary": {"reason": reason},
+        }
+        _attach_callback_identity(result_payload, job_id=job_id, submission_id=submission_id)
+        from finflow_agent.jobs.callbacks import send_backend_callback
+        await send_backend_callback(result_payload, job_id, repository)
+        return
 
     
     if isinstance(plan_or_dict, dict) and plan_or_dict.get("status") == "quarantined":
-        reason = plan_or_dict.get("reason") or "Request quarantined by Orchestrator."
+        reason = plan_or_dict.get("reason") or "Request quarantined by canonical planner."
         logger.info(
             "Agent job planning quarantined job_id=%s submission_id=%s reason=%s",
             job_id,
@@ -242,7 +308,7 @@ async def handle_upload(payload: JobPayload, background_tasks = None):
     
     await app.state.redis.enqueue_job(
         "process_job_task",
-        payload.model_dump(),
+        payload.model_dump(exclude_none=True),
         _job_id=job_id
     )
     

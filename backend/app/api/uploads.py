@@ -1,7 +1,9 @@
+from copy import deepcopy
 from datetime import UTC, datetime
 from pathlib import Path
 from uuid import UUID
 import warnings
+from typing import Any
 
 import pandas as pd
 from fastapi import APIRouter, BackgroundTasks, Depends, File, Form, HTTPException, Query, Request, UploadFile
@@ -16,6 +18,7 @@ from app.core.security import require_roles
 from app.db.session import get_db
 from app.models import AuditLog, Review, Submission, SubmissionRecord, SubmissionStatus, User, UserRole, normalize_submission_status
 from app.services.agent_dispatcher import enqueue_submission_dispatch
+from app.services.intent_revision import persist_intent_revision
 from app.schemas import JobAgentSummaryRead, JobAuditEntryRead, JobDetailRead, JobStepRead, UploadMetadataRead, UploadPreview, UploadSummary, UploadVersionRead
 from app.services.excel_parser import SUPPORTED_EXTENSIONS, validate_extension
 from app.services.file_validation import validate_file_signature
@@ -870,6 +873,23 @@ async def save_upload(
 class ConfirmExtractionRequest(BaseModel):
     preview_token: str
 
+
+class ConfirmInterpretationRequest(BaseModel):
+    reason: str | None = None
+
+
+class ReplaceColumnMappingRequest(BaseModel):
+    mapping: dict[str, str | list[str]]
+    reason: str | None = None
+
+
+class RejectInterpretationRequest(BaseModel):
+    reason: str | None = None
+
+
+class ResumeJobRequest(BaseModel):
+    reason: str | None = None
+
 @router.post("/{upload_id}/confirm-extraction")
 async def confirm_extraction(
     upload_id: UUID,
@@ -1031,6 +1051,413 @@ async def decline_schema_proposal(
     await ws_manager.broadcast("uploads", "schema.declined", payload)
     await ws_manager.broadcast("dashboard", "dashboard_refresh", payload)
 
+    return await get_upload(upload_id, db, user)
+
+
+def _current_canonical_intent_payload(submission: Submission) -> dict[str, Any] | None:
+    summary = submission.summary if isinstance(submission.summary, dict) else {}
+    schema_proposal = summary.get("schema_proposal") if isinstance(summary.get("schema_proposal"), dict) else None
+    if schema_proposal and isinstance(schema_proposal.get("canonical_intent"), dict):
+        return deepcopy(schema_proposal["canonical_intent"])
+    canonical_intent = summary.get("canonical_intent")
+    if isinstance(canonical_intent, dict):
+        return deepcopy(canonical_intent)
+    if isinstance(submission.canonical_intent, dict):
+        return deepcopy(submission.canonical_intent)
+    return None
+
+
+def _canonical_intent_has_unresolved_fields(canonical_intent: dict[str, Any]) -> bool:
+    for action in canonical_intent.get("actions", []):
+        if not isinstance(action, dict):
+            continue
+        if action.get("kind") in {"project_columns", "drop_columns"}:
+            for field in action.get("requested_fields", []):
+                if not isinstance(field, dict):
+                    return True
+                if not field.get("resolved_column") and not field.get("resolved_columns"):
+                    return True
+        elif action.get("kind") == "filter_rows":
+            for condition in action.get("conditions", []):
+                if not isinstance(condition, dict):
+                    return True
+                field = condition.get("field")
+                if isinstance(field, dict) and not field.get("resolved_column") and not field.get("resolved_columns"):
+                    return True
+    return False
+
+
+def _normalise_column_mapping(mapping: dict[str, str | list[str]]) -> dict[str, list[str]]:
+    normalised: dict[str, list[str]] = {}
+    for raw_key, raw_value in mapping.items():
+        key = str(raw_key or "").strip()
+        if not key:
+            continue
+        if isinstance(raw_value, list):
+            values = [str(item).strip() for item in raw_value if str(item).strip()]
+        else:
+            values = [str(raw_value).strip()] if str(raw_value or "").strip() else []
+        if values:
+            normalised[key] = values
+    return normalised
+
+
+def _match_column_mapping(field: dict[str, Any], mapping: dict[str, list[str]]) -> list[str] | None:
+    candidates = [
+        str(field.get("raw_reference", "")).strip(),
+        str(field.get("resolved_column", "")).strip(),
+    ]
+    candidates.extend(str(value).strip() for value in field.get("candidate_columns", []) if str(value).strip())
+    normalized_candidates = {str(candidate).lower(): candidate for candidate in candidates if candidate}
+    normalized_candidates.update({str(candidate).replace("_", " ").lower(): candidate for candidate in candidates if candidate})
+    for key, value in mapping.items():
+        key_normalized = str(key).strip().lower()
+        if key_normalized in normalized_candidates or key_normalized.replace("_", " ") in normalized_candidates:
+            return value
+    return None
+
+
+def _apply_column_mapping_to_canonical_intent(canonical_intent: dict[str, Any], mapping: dict[str, str | list[str]]) -> tuple[dict[str, Any], bool]:
+    normalised_mapping = _normalise_column_mapping(mapping)
+    revised = deepcopy(canonical_intent)
+    changed = False
+    for action in revised.get("actions", []):
+        if not isinstance(action, dict):
+            continue
+        kind = action.get("kind")
+        if kind in {"project_columns", "drop_columns"}:
+            for field in action.get("requested_fields", []):
+                if not isinstance(field, dict):
+                    continue
+                resolved = _match_column_mapping(field, normalised_mapping)
+                if not resolved:
+                    continue
+                changed = True
+                field["candidate_columns"] = list(dict.fromkeys(resolved))
+                field["resolved_columns"] = list(dict.fromkeys(resolved))
+                field["selection_mode"] = "semantic_family" if len(resolved) > 1 else "single"
+                field["resolved_column"] = resolved[0] if len(resolved) == 1 else None
+                field["resolution_method"] = "human_correction"
+            continue
+        if kind == "filter_rows":
+            for condition in action.get("conditions", []):
+                if not isinstance(condition, dict):
+                    continue
+                field = condition.get("field")
+                if not isinstance(field, dict):
+                    continue
+                resolved = _match_column_mapping(field, normalised_mapping)
+                if not resolved:
+                    continue
+                if len(resolved) != 1:
+                    raise HTTPException(status_code=400, detail="Filter conditions must resolve to exactly one column")
+                changed = True
+                field["candidate_columns"] = [resolved[0]]
+                field["resolved_columns"] = [resolved[0]]
+                field["selection_mode"] = "single"
+                field["resolved_column"] = resolved[0]
+                field["resolution_method"] = "human_correction"
+            continue
+        if kind == "sort_rows":
+            for key in action.get("sort_keys", []):
+                if not isinstance(key, dict):
+                    continue
+                field = key.get("column")
+                if not isinstance(field, dict):
+                    continue
+                resolved = _match_column_mapping(field, normalised_mapping)
+                if not resolved:
+                    continue
+                if len(resolved) != 1:
+                    raise HTTPException(status_code=400, detail="Sort keys must resolve to exactly one column")
+                changed = True
+                field["candidate_columns"] = [resolved[0]]
+                field["resolved_columns"] = [resolved[0]]
+                field["selection_mode"] = "single"
+                field["resolved_column"] = resolved[0]
+                field["resolution_method"] = "human_correction"
+            continue
+        if kind == "visualize":
+            for field in action.get("fields", []):
+                if not isinstance(field, dict):
+                    continue
+                resolved = _match_column_mapping(field, normalised_mapping)
+                if not resolved:
+                    continue
+                changed = True
+                field["candidate_columns"] = list(dict.fromkeys(resolved))
+                field["resolved_columns"] = list(dict.fromkeys(resolved))
+                field["selection_mode"] = "semantic_family" if len(resolved) > 1 else "single"
+                field["resolved_column"] = resolved[0] if len(resolved) == 1 else None
+                field["resolution_method"] = "human_correction"
+            continue
+        if kind == "rename_columns":
+            for mapping_item in action.get("mapping", []):
+                if not isinstance(mapping_item, dict):
+                    continue
+                source = mapping_item.get("source")
+                if not isinstance(source, dict):
+                    continue
+                resolved = _match_column_mapping(source, normalised_mapping)
+                if not resolved or len(resolved) != 1:
+                    continue
+                changed = True
+                source["candidate_columns"] = [resolved[0]]
+                source["resolved_columns"] = [resolved[0]]
+                source["selection_mode"] = "single"
+                source["resolved_column"] = resolved[0]
+                source["resolution_method"] = "human_correction"
+    if changed:
+        revised["resolution_status"] = "repaired"
+        revised["grounded_at"] = datetime.now(UTC)
+    return revised, changed
+
+
+async def _persist_reviewed_canonical_intent(
+    db: AsyncSession,
+    submission: Submission,
+    canonical_intent: dict[str, Any],
+    *,
+    original_instruction: str,
+    review_status: str,
+    review_reason: str | None = None,
+    resume: bool = True,
+) -> dict[str, Any]:
+    parent_intent_id = UUID(str(submission.intent_id)) if submission.intent_id else None
+    revision_payload = await persist_intent_revision(
+        db,
+        submission=submission,
+        canonical_intent=canonical_intent,
+        original_instruction=original_instruction,
+        parent_intent_id=parent_intent_id,
+    )
+    summary = submission.summary if isinstance(submission.summary, dict) else {}
+    reviewed_intent = deepcopy(canonical_intent)
+    reviewed_intent.update(
+        {
+            "intent_id": revision_payload["intent_id"],
+            "intent_revision": revision_payload["intent_revision"],
+            "intent_hash": revision_payload["intent_hash"],
+            "parent_intent_id": revision_payload["parent_intent_id"],
+            "capability_version": revision_payload["capability_version"],
+            "capability_snapshot": revision_payload["capability_snapshot"],
+            "created_at": revision_payload["created_at"],
+            "grounded_at": revision_payload["grounded_at"],
+        }
+    )
+    submission.summary = {
+        **summary,
+        "canonical_intent": reviewed_intent,
+        "canonical_intent_schema_version": reviewed_intent.get("schema_version", "2.0"),
+        "canonical_intent_status": reviewed_intent.get("resolution_status", "resolved"),
+        "review_status": review_status,
+        "review_reason": review_reason,
+        "original_instruction": original_instruction,
+        "intent_id": revision_payload["intent_id"],
+        "intent_revision": revision_payload["intent_revision"],
+        "intent_hash": revision_payload["intent_hash"],
+        "parent_intent_id": revision_payload["parent_intent_id"],
+        "grounded_at": revision_payload["grounded_at"],
+        "capability_version": revision_payload["capability_version"],
+    }
+    submission.status = SubmissionStatus.queued if resume else SubmissionStatus.awaiting_confirmation
+    submission.agent_task_id = None
+    await db.commit()
+    if resume:
+        await enqueue_submission_dispatch(submission.id, persist_revision=False)
+    return reviewed_intent
+
+
+@router.post("/{upload_id}/confirm-interpretation", response_model=UploadPreview)
+async def confirm_interpretation(
+    upload_id: UUID,
+    payload: ConfirmInterpretationRequest,
+    db: AsyncSession = Depends(get_db),
+    user: User = Depends(require_roles(UserRole.employee, UserRole.manager, UserRole.admin)),
+) -> UploadPreview:
+    submission = (
+        await db.execute(
+            select(Submission)
+            .options(selectinload(Submission.user), selectinload(Submission.review))
+            .where(Submission.id == upload_id)
+            .with_for_update()
+        )
+    ).scalar_one_or_none()
+    if not submission:
+        raise HTTPException(status_code=404, detail="Submission not found")
+    verify_upload_access(submission, user)
+
+    canonical_intent = _current_canonical_intent_payload(submission)
+    if canonical_intent is None:
+        raise HTTPException(status_code=409, detail="No canonical intent is available for confirmation")
+    if _canonical_intent_has_unresolved_fields(canonical_intent):
+        raise HTTPException(status_code=409, detail="Canonical intent still contains unresolved fields. Replace the mapping first.")
+
+    await _persist_reviewed_canonical_intent(
+        db,
+        submission,
+        canonical_intent,
+        original_instruction=str(submission.instruction or "").strip(),
+        review_status="confirmed",
+        review_reason=payload.reason,
+        resume=True,
+    )
+    payload_out = {
+        "upload_id": submission.id,
+        "filename": submission.file_name,
+        "status": _submission_status_text(submission.status),
+        "agent_status": _submission_status_text(submission.status),
+        "review_status": "confirmed",
+    }
+    await ws_manager.broadcast("uploads", "canonical_intent.confirmed", payload_out)
+    await ws_manager.broadcast("uploads", "upload_status", payload_out)
+    await ws_manager.broadcast("dashboard", "dashboard_refresh", payload_out)
+    return await get_upload(upload_id, db, user)
+
+
+@router.post("/{upload_id}/replace-column-mapping", response_model=UploadPreview)
+async def replace_column_mapping(
+    upload_id: UUID,
+    payload: ReplaceColumnMappingRequest,
+    db: AsyncSession = Depends(get_db),
+    user: User = Depends(require_roles(UserRole.employee, UserRole.manager, UserRole.admin)),
+) -> UploadPreview:
+    submission = (
+        await db.execute(
+            select(Submission)
+            .options(selectinload(Submission.user), selectinload(Submission.review))
+            .where(Submission.id == upload_id)
+            .with_for_update()
+        )
+    ).scalar_one_or_none()
+    if not submission:
+        raise HTTPException(status_code=404, detail="Submission not found")
+    verify_upload_access(submission, user)
+
+    canonical_intent = _current_canonical_intent_payload(submission)
+    if canonical_intent is None:
+        raise HTTPException(status_code=409, detail="No canonical intent is available for replacement")
+
+    revised_intent, changed = _apply_column_mapping_to_canonical_intent(canonical_intent, payload.mapping)
+    if not changed:
+        raise HTTPException(status_code=400, detail="No fields matched the provided mapping")
+
+    await _persist_reviewed_canonical_intent(
+        db,
+        submission,
+        revised_intent,
+        original_instruction=str(submission.instruction or "").strip(),
+        review_status="corrected",
+        review_reason=payload.reason,
+        resume=True,
+    )
+    payload_out = {
+        "upload_id": submission.id,
+        "filename": submission.file_name,
+        "status": _submission_status_text(submission.status),
+        "agent_status": _submission_status_text(submission.status),
+        "review_status": "corrected",
+    }
+    await ws_manager.broadcast("uploads", "canonical_intent.corrected", payload_out)
+    await ws_manager.broadcast("uploads", "upload_status", payload_out)
+    await ws_manager.broadcast("dashboard", "dashboard_refresh", payload_out)
+    return await get_upload(upload_id, db, user)
+
+
+@router.post("/{upload_id}/reject-interpretation", response_model=UploadPreview)
+async def reject_interpretation(
+    upload_id: UUID,
+    payload: RejectInterpretationRequest,
+    db: AsyncSession = Depends(get_db),
+    user: User = Depends(require_roles(UserRole.employee, UserRole.manager, UserRole.admin)),
+) -> UploadPreview:
+    submission = (
+        await db.execute(
+            select(Submission)
+            .options(selectinload(Submission.user), selectinload(Submission.review))
+            .where(Submission.id == upload_id)
+            .with_for_update()
+        )
+    ).scalar_one_or_none()
+    if not submission:
+        raise HTTPException(status_code=404, detail="Submission not found")
+    verify_upload_access(submission, user)
+
+    canonical_intent = _current_canonical_intent_payload(submission)
+    if canonical_intent is None:
+        raise HTTPException(status_code=409, detail="No canonical intent is available for rejection")
+
+    summary = submission.summary if isinstance(submission.summary, dict) else {}
+    submission.summary = {
+        **summary,
+        "canonical_intent_status": "rejected",
+        "review_status": "rejected",
+        "review_reason": payload.reason,
+    }
+    submission.status = SubmissionStatus.awaiting_confirmation
+    submission.agent_task_id = None
+    await db.commit()
+
+    payload_out = {
+        "upload_id": submission.id,
+        "filename": submission.file_name,
+        "status": _submission_status_text(submission.status),
+        "agent_status": _submission_status_text(submission.status),
+        "review_status": "rejected",
+        "error": payload.reason or "The canonical interpretation was rejected by the user.",
+    }
+    await ws_manager.broadcast("uploads", "canonical_intent.rejected", payload_out)
+    await ws_manager.broadcast("uploads", "upload_status", payload_out)
+    await ws_manager.broadcast("dashboard", "dashboard_refresh", payload_out)
+    return await get_upload(upload_id, db, user)
+
+
+@router.post("/{upload_id}/resume-job", response_model=UploadPreview)
+async def resume_job(
+    upload_id: UUID,
+    payload: ResumeJobRequest,
+    db: AsyncSession = Depends(get_db),
+    user: User = Depends(require_roles(UserRole.employee, UserRole.manager, UserRole.admin)),
+) -> UploadPreview:
+    submission = (
+        await db.execute(
+            select(Submission)
+            .options(selectinload(Submission.user), selectinload(Submission.review))
+            .where(Submission.id == upload_id)
+            .with_for_update()
+        )
+    ).scalar_one_or_none()
+    if not submission:
+        raise HTTPException(status_code=404, detail="Submission not found")
+    verify_upload_access(submission, user)
+
+    canonical_intent = _current_canonical_intent_payload(submission)
+    if canonical_intent is None:
+        raise HTTPException(status_code=409, detail="No canonical intent is available to resume")
+    if _canonical_intent_has_unresolved_fields(canonical_intent):
+        raise HTTPException(status_code=409, detail="Canonical intent still contains unresolved fields. Replace the mapping first.")
+
+    summary = submission.summary if isinstance(submission.summary, dict) else {}
+    submission.summary = {
+        **summary,
+        "canonical_intent_status": canonical_intent.get("resolution_status", "resolved"),
+        "review_status": "resumed",
+        "review_reason": payload.reason,
+    }
+    submission.status = SubmissionStatus.queued
+    await db.commit()
+    await enqueue_submission_dispatch(submission.id, persist_revision=False)
+
+    payload_out = {
+        "upload_id": submission.id,
+        "filename": submission.file_name,
+        "status": _submission_status_text(submission.status),
+        "agent_status": _submission_status_text(submission.status),
+        "review_status": "resumed",
+    }
+    await ws_manager.broadcast("uploads", "canonical_intent.resumed", payload_out)
+    await ws_manager.broadcast("uploads", "upload_status", payload_out)
+    await ws_manager.broadcast("dashboard", "dashboard_refresh", payload_out)
     return await get_upload(upload_id, db, user)
 
 

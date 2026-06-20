@@ -152,6 +152,14 @@ class FilterOperationPlan(BaseModel):
     select_columns: Optional[List[str]] = None
     limit: Optional[int] = None
 
+    @model_validator(mode="before")
+    @classmethod
+    def normalize_logic(cls, data: Any) -> Any:
+        if isinstance(data, dict) and isinstance(data.get("logic"), str):
+            data = dict(data)
+            data["logic"] = data["logic"].lower()
+        return data
+
 # -------------------------------------------------------------------
 # CALCULATION SCHEMAS
 # -------------------------------------------------------------------

@@ -26,6 +26,7 @@ missing or ``None`` the agent returns the canonical ``failed`` envelope.
 
 from __future__ import annotations
 
+import logging
 import os
 import uuid
 from typing import Any, List, Optional
@@ -33,7 +34,6 @@ from typing import Any, List, Optional
 import pandas as pd
 from pydantic import BaseModel, ValidationError, model_validator
 
-from finflow_agent.llm import get_chat_groq
 from finflow_agent.operations.executor import execute_reporting_plan
 from finflow_agent.operations.reporting_handlers import (
     AuditSheetPayload,
@@ -205,10 +205,9 @@ class ReportingAgent:
         params = params or {}
         input_data = input_data or {}
 
-        # 2. Resolve the ReportingOperationPlan. The structured path
-        #    (params["plan"]) is preferred and is what the compiler emits;
-        #    the optional Groq path is preserved for back-compat with
-        #    callers that drive reporting via a free-text instruction.
+        # 2. Resolve the ReportingOperationPlan. The compiler emits the
+        #    structured path (`params["plan"]`) and raw instructions are
+        #    no longer accepted.
         plan_or_failure = self._resolve_plan(params)
         if isinstance(plan_or_failure, AgentResult):
             return plan_or_failure
@@ -364,83 +363,13 @@ class ReportingAgent:
                     ),
                 )
 
-        api_key = os.environ.get("GROQ_API_KEY")
-        instruction = params.get("instruction")
-        if api_key and instruction:
-            return self._build_plan_via_llm(instruction)
-
-        # Last-resort default. Mirrors the historic behaviour (xlsx default
-        # output, optional sheet_name / title from raw params).
-        try:
-            return ReportingOperationPlan(
-                output_format=params.get("output_format", "xlsx"),
-                sheet_name=params.get("sheet_name"),
-                title=params.get("title"),
-            )
-        except Exception as exc:
-            return AgentResult(
-                status="failed",
-                error_message=(
-                    "Failed to build reporting plan from fallback params "
-                    f"(output_format={params.get('output_format', 'xlsx')!r}, "
-                    f"sheet_name={params.get('sheet_name')!r}, title={params.get('title')!r}): {exc}"
-                ),
-            )
-
-    def _build_plan_via_llm(self, instruction: str):
-        try:
-            llm = get_chat_groq(
-                model_name="llama-3.3-70b-versatile",
-                temperature=0,
-            )
-        except ImportError:
-            return AgentResult(
-                status="failed",
-                error_message=(
-                    "langchain-groq is not installed in the agent-service "
-                    "image. Install langchain-groq or disable LLM-based "
-                    "planning."
-                ),
-            )
-
-        try:
-            from langchain_core.prompts import PromptTemplate
-
-            structured_llm = llm.with_structured_output(ReportingOperationPlan)
-
-            system_prompt = (
-                "You are a professional reporting assistant. You are\n"
-                "provided with a user instruction. Generate a\n"
-                "ReportingOperationPlan specifying the output format and\n"
-                "layout options.\n\n"
-                "User Instruction: {instruction}\n\n"
-                "Output ONLY a valid ReportingOperationPlan.\n"
-                "Output format must be one of: xlsx, csv, json, txt.\n"
-                "If the user did not specify a format, default to xlsx."
-            )
-
-            prompt = PromptTemplate.from_template(system_prompt)
-            chain = prompt | structured_llm
-            result = chain.invoke({"instruction": instruction})
-        except Exception as exc:
-            return AgentResult(
-                status="failed",
-                error_message=(
-                    f"Failed to generate reporting plan via LLM for instruction={instruction!r}: {exc}"
-                ),
-            )
-
-        if isinstance(result, ReportingOperationPlan):
-            return result
-        try:
-            return ReportingOperationPlan.model_validate(result)
-        except Exception as exc:
-            return AgentResult(
-                status="failed",
-                error_message=(
-                    f"LLM returned an invalid ReportingOperationPlan: {exc}"
-                ),
-            )
+        return AgentResult(
+            status="failed",
+            error_message=(
+                "ReportingAgent requires a typed ReportingOperationPlan; "
+                "canonical execution does not accept raw instructions."
+            ),
+        )
 
     # ------------------------------------------------------------------
     # XLSX path: delegate to the audit-sheet writer.
@@ -505,3 +434,4 @@ class ReportingAgent:
             warnings=[],
             artifacts=artifacts,
         )
+logger = logging.getLogger(__name__)

@@ -114,6 +114,19 @@ class Submission(Base):
         nullable=False,
     )
     summary: Mapped[dict | None] = mapped_column(JSONB)
+    canonical_intent: Mapped[dict | None] = mapped_column(JSONB)
+    canonical_intent_schema_version: Mapped[str | None] = mapped_column(String(16))
+    intent_status: Mapped[str | None] = mapped_column(String(40))
+    intent_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))
+    intent_revision: Mapped[int | None] = mapped_column(Integer)
+    intent_hash: Mapped[str | None] = mapped_column(String(64))
+    parent_intent_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))
+    grounded_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    intent_extractor_version: Mapped[str | None] = mapped_column(String(32))
+    intent_normalizer_version: Mapped[str | None] = mapped_column(String(32))
+    intent_grounding_version: Mapped[str | None] = mapped_column(String(32))
+    intent_created_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    capability_version: Mapped[str | None] = mapped_column(String(32))
     output_path: Mapped[str | None] = mapped_column(String(500))
     preferred_agent_name: Mapped[str | None] = mapped_column(String(120))
     dispatched_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
@@ -125,6 +138,56 @@ class Submission(Base):
     review: Mapped["Review | None"] = relationship(back_populates="submission", cascade="all, delete-orphan")
     structured_records: Mapped[list["SubmissionRecord"]] = relationship(back_populates="submission", cascade="all, delete-orphan")
     comments: Mapped[list["SubmissionComment"]] = relationship(back_populates="submission", cascade="all, delete-orphan")
+    intent_revisions: Mapped[list["CanonicalIntentRevision"]] = relationship(back_populates="submission", cascade="all, delete-orphan")
+    intent_outbox_events: Mapped[list["IntentDispatchOutbox"]] = relationship(back_populates="submission", cascade="all, delete-orphan")
+
+
+class CanonicalIntentRevision(Base):
+    __tablename__ = "canonical_intent_revisions"
+    __table_args__ = (
+        UniqueConstraint("intent_id", "intent_revision", name="uq_canonical_intent_revision"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    submission_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("submissions.id", ondelete="CASCADE"), nullable=False)
+    intent_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    intent_revision: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    intent_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    parent_intent_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))
+    canonical_intent: Mapped[dict] = mapped_column(JSONB, nullable=False)
+    original_instruction: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    grounded_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    capability_version: Mapped[str | None] = mapped_column(String(32))
+    extractor_version: Mapped[str | None] = mapped_column(String(32))
+    normalizer_version: Mapped[str | None] = mapped_column(String(32))
+    grounding_version: Mapped[str | None] = mapped_column(String(32))
+    compiler_version: Mapped[str | None] = mapped_column(String(32))
+    execution_plan_id: Mapped[str | None] = mapped_column(String(64))
+    execution_plan_hash: Mapped[str | None] = mapped_column(String(64))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+    submission: Mapped["Submission"] = relationship(back_populates="intent_revisions")
+
+
+class IntentDispatchOutbox(Base):
+    __tablename__ = "intent_dispatch_outbox"
+    __table_args__ = (
+        UniqueConstraint("submission_id", "intent_hash", name="uq_intent_dispatch_outbox_submission_hash"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    submission_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("submissions.id", ondelete="CASCADE"), nullable=False)
+    intent_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    intent_revision: Mapped[int] = mapped_column(Integer, nullable=False)
+    intent_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    payload: Mapped[dict] = mapped_column(JSONB, nullable=False)
+    status: Mapped[str] = mapped_column(String(32), nullable=False, default="pending")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    available_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    delivered_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    last_error: Mapped[str | None] = mapped_column(Text)
+
+    submission: Mapped["Submission"] = relationship(back_populates="intent_outbox_events")
 
 
 class Review(Base):
