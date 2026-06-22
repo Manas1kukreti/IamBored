@@ -74,8 +74,19 @@ def apply_fill_nulls(df: pd.DataFrame, op: FillNullsOperation) -> Dict[str, Any]
     return {"columns_affected": cols}
 
 def apply_drop_nulls(df: pd.DataFrame, op: DropNullsOperation) -> Dict[str, Any]:
-    cols = [c for c in op.columns if c in df.columns] if op.columns else None
-    df.dropna(subset=cols, how=op.how, inplace=True)
+    cols = [c for c in op.columns if c in df.columns] if op.columns else list(df.columns)
+    if not cols:
+        return {}
+
+    for col in cols:
+        series = df[col]
+        if series.dtype == object or pd.api.types.is_string_dtype(series):
+            blank_mask = series.notna() & series.astype(str).str.strip().eq("")
+            if blank_mask.any():
+                df.loc[blank_mask, col] = pd.NA
+
+    subset = cols if op.columns else None
+    df.dropna(subset=subset, how=op.how, inplace=True)
     return {}
 
 def apply_normalize_date(df: pd.DataFrame, op: NormalizeDateOperation) -> Dict[str, Any]:

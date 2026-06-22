@@ -98,7 +98,7 @@ def resolve_value_domain(
     rather than being quarantined for lacking exact preview-domain evidence.
     """
 
-    op = str(operator or "").strip().lower()
+    op = str(getattr(operator, "value", operator) or "").strip().lower()
     column_name = str(series.name or "").strip()
 
     if op not in _TEXT_DOMAIN_OPERATORS:

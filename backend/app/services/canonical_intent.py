@@ -37,6 +37,7 @@ class UnresolvedColumnReference(BaseModel):
 
     raw_reference: str
     resolved_column: str | None = None
+    grounded_value: str | None = None
     resolution_method: str | None = None
     selection_mode: Literal["single", "semantic_family", "ambiguous"] | None = None
     resolved_columns: list[str] = Field(default_factory=list)
@@ -253,10 +254,19 @@ _SORT_RE = re.compile(r"\b(?:sort|order)\s+by\s+(.+)$", re.IGNORECASE)
 _LIMIT_RE = re.compile(r"\b(?:top|first|limit|only first)\s+(\d+)\b", re.IGNORECASE)
 _OUTPUT_FORMAT_RE = re.compile(r"\b(xlsx|csv|json|txt)\b", re.IGNORECASE)
 _FILTER_INTENT_PREFIX = re.compile(
-    r"^\s*(?:clean(?:\s+this\s+data)?\s+and\s+)?"
+    r"^\s*(?:clean(?:\s+(?:the|this)\s+data)?\s+and\s+)?"
     r"(?:only allow|keep only|only keep|show only|only show|only return|filter|"
     r"extract\s+rows?|return\s+rows?|pull(?:\s+out)?\s+rows?|remove|drop|exclude|"
     r"do not allow|don't allow|dont allow|wipe out|get rid of|delete)\s*",
+    re.IGNORECASE,
+)
+
+_NULL_ROW_CLEANUP_VERB_RE = re.compile(
+    r"\b(?:remove(?:s)?|drop(?:s)?|delete(?:s)?|omit(?:s)?|exclude(?:s)?|wipe out|get rid of)\s+(?:the\s+)?rows?\b",
+    re.IGNORECASE,
+)
+_NULL_ROW_CLEANUP_HINT_RE = re.compile(
+    r"\b(?:null|empty|blank|missing)\b",
     re.IGNORECASE,
 )
 
@@ -389,6 +399,9 @@ def _try_semantic_extraction(
             )
             new_result = _repair_select_all_projection(new_result, instruction=instruction, source_columns=source_columns)
             new_result = _repair_profile_grounded_references(new_result, dataframe_profile, submission_id=submission_id)
+            new_result = _repair_null_row_cleanup(new_result, instruction=instruction)
+            if isinstance(new_result, dict):
+                new_result["intent_hash"] = compute_intent_hash(new_result)
             logger.info("New pipeline extraction succeeded for: %s", instruction[:80])
             return new_result
 
@@ -497,14 +510,31 @@ def _single_dict_to_unresolved(
     if not isinstance(field, dict):
         return None
     raw_ref = str(field.get("raw_reference", "")).strip()
-    resolved = str(field.get("resolved_column", "")).strip() or None
-    method = str(field.get("resolution_method", "")).strip() or None
+    resolved = str(field.get("resolved_column") or "").strip() or None
+    method = str(field.get("resolution_method") or "").strip() or None
     if not raw_ref and not resolved:
         return None
     return UnresolvedColumnReference(
         raw_reference=raw_ref or (resolved or ""),
         resolved_column=resolved,
+        grounded_value=str(field.get("grounded_value") or "").strip() or None,
         resolution_method=method,
+        selection_mode=str(field.get("selection_mode") or "").strip() or None,
+        resolved_columns=[
+            str(column).strip()
+            for column in (field.get("resolved_columns") or [])
+            if str(column).strip()
+        ],
+        candidate_columns=[
+            str(column).strip()
+            for column in (field.get("candidate_columns") or [])
+            if str(column).strip()
+        ],
+        evidence=[
+            str(item).strip()
+            for item in (field.get("evidence") or [])
+            if str(item).strip()
+        ],
     )
 
 
@@ -718,12 +748,18 @@ def build_canonical_intent(
         capability_snapshot=capability_snapshot_model.model_dump(mode="json"),
         grounded_at=datetime.now(UTC),
     )
-    canonical.intent_hash = compute_intent_hash(canonical)
-    return _repair_profile_grounded_references(
+    canonical_dict = _repair_null_row_cleanup(
         canonical.model_dump(mode="json"),
+        instruction=instruction,
+    )
+    canonical_dict = _repair_profile_grounded_references(
+        canonical_dict,
         dataframe_profile,
         submission_id=submission_id,
     )
+    if isinstance(canonical_dict, dict):
+        canonical_dict["intent_hash"] = compute_intent_hash(canonical_dict)
+    return canonical_dict
 
 
 def canonical_intent_to_legacy_action_schema(canonical_intent: dict[str, Any]) -> dict[str, Any]:
@@ -862,7 +898,8 @@ def build_action_schema_from_canonical_intent(
 
 def _extract_clean_action(normalized_prompt: str) -> CleanIntent | None:
     if not _CLEAN_RE.search(normalized_prompt):
-        return None
+        if not _looks_like_null_row_cleanup(normalized_prompt):
+            return None
     operations = []
     if "deduplicate" in normalized_prompt or "duplicate" in normalized_prompt:
         operations.append(CleaningIntentOperation(name="deduplicate"))
@@ -870,6 +907,13 @@ def _extract_clean_action(normalized_prompt: str) -> CleanIntent | None:
         operations.append(CleaningIntentOperation(name="trim_whitespace"))
     if "normalize" in normalized_prompt or "normalise" in normalized_prompt or "standardize" in normalized_prompt or "standardise" in normalized_prompt:
         operations.append(CleaningIntentOperation(name="normalize_values"))
+    if _looks_like_null_row_cleanup(normalized_prompt):
+        operations.append(
+            CleaningIntentOperation(
+                name="drop_nulls",
+                parameters={"columns": None, "how": "any"},
+            )
+        )
     return CleanIntent(kind="clean", mode="explicit" if operations else "safe_default", operations=operations)
 
 
@@ -932,6 +976,8 @@ def _extract_drop_columns_action(
     role_columns: dict[str, list[str]],
     dataframe_profile: dict[str, Any],
 ) -> tuple[DropColumnsIntent | None, list[str], list[str], list[str]]:
+    if _looks_like_null_row_cleanup(normalized_prompt):
+        return None, [], [], []
     if not any(verb in normalized_prompt for verb in _DROP_COLUMN_VERBS):
         return None, [], [], []
 
@@ -971,7 +1017,13 @@ def _extract_filter_rows_action(
     if membership_filter is not None:
         return membership_filter, membership_evidence, membership_assumptions, membership_notes
 
-    clauses, connectors = _split_filter_clauses(_strip_filter_prefix(normalized_prompt))
+    filter_prompt = _strip_filter_prefix(normalized_prompt)
+    if _looks_like_null_row_cleanup(filter_prompt):
+        cleanup_match = _NULL_ROW_CLEANUP_VERB_RE.search(filter_prompt)
+        if cleanup_match:
+            filter_prompt = filter_prompt[: cleanup_match.start()].strip(" ,.;")
+
+    clauses, connectors = _split_filter_clauses(filter_prompt)
     if not clauses:
         return None, [], [], []
 
@@ -1120,7 +1172,15 @@ def _looks_like_filter_request(normalized_prompt: str) -> bool:
 
 
 def _looks_like_drop_row_request(normalized_prompt: str) -> bool:
-    return bool(re.search(r"\b(?:remove|drop|delete|omit|exclude|wipe out|get rid of)\s+(?:rows?|records?)\b", normalized_prompt))
+    return bool(re.search(r"\b(?:remove(?:s)?|drop(?:s)?|delete(?:s)?|omit(?:s)?|exclude(?:s)?|wipe out|get rid of)\s+(?:rows?|records?)\b", normalized_prompt))
+
+
+def _looks_like_null_row_cleanup(normalized_prompt: str) -> bool:
+    if not _ROW_HINT_RE.search(normalized_prompt):
+        return False
+    if not _NULL_ROW_CLEANUP_HINT_RE.search(normalized_prompt):
+        return False
+    return bool(_NULL_ROW_CLEANUP_VERB_RE.search(normalized_prompt))
 
 
 def _looks_like_output_format_request(normalized_prompt: str) -> bool:
@@ -1276,6 +1336,12 @@ _GENERIC_FIELD_REFERENCES = {
     "which",
     "that",
     "education",
+    "status",
+    "state",
+    "type",
+    "category",
+    "level",
+    "kind",
 }
 
 _PAYMENT_VALUE_HINTS = {
@@ -1307,7 +1373,6 @@ _STATUS_VALUE_HINTS = {
     "cancelled",
     "canceled",
 }
-
 
 def _repair_profile_grounded_references(
     canonical_intent: dict[str, Any],
@@ -1377,6 +1442,83 @@ def _repair_profile_grounded_references(
         and str(canonical_intent.get("resolution_status", "")).strip() == "needs_clarification"
     ):
         canonical_intent["resolution_status"] = "repaired"
+
+    return canonical_intent
+
+
+def _repair_null_row_cleanup(
+    canonical_intent: dict[str, Any],
+    *,
+    instruction: str,
+) -> dict[str, Any]:
+    if not isinstance(canonical_intent, dict):
+        return canonical_intent
+
+    normalized_instruction = _normalize_text(instruction)
+    if not _looks_like_null_row_cleanup(normalized_instruction):
+        return canonical_intent
+
+    actions = canonical_intent.get("actions")
+    if not isinstance(actions, list):
+        return canonical_intent
+
+    repaired = False
+    retained_actions: list[Any] = []
+    clean_action: dict[str, Any] | None = None
+
+    for action in actions:
+        if not isinstance(action, dict):
+            retained_actions.append(action)
+            continue
+
+        kind = str(action.get("kind", "")).strip()
+        if kind == "drop_columns":
+            repaired = True
+            continue
+        if kind == "clean" and clean_action is None:
+            clean_action = action
+        retained_actions.append(action)
+
+    if clean_action is None:
+        clean_action = {
+            "kind": "clean",
+            "mode": "explicit",
+            "operations": [],
+        }
+        retained_actions.insert(0, clean_action)
+        repaired = True
+
+    operations = clean_action.get("operations")
+    if not isinstance(operations, list):
+        operations = []
+        clean_action["operations"] = operations
+
+    if not any(isinstance(op, dict) and str(op.get("name", "")).strip() == "drop_nulls" for op in operations):
+        operations.append(
+            {
+                "name": "drop_nulls",
+                "parameters": {"columns": None, "how": "any"},
+            }
+        )
+        repaired = True
+
+    clean_action["mode"] = "explicit"
+    canonical_intent["actions"] = retained_actions
+    canonical_intent["decision"] = _build_decision_summary(retained_actions)
+
+    if repaired:
+        canonical_intent["resolution_status"] = "repaired"
+        evidence = canonical_intent.get("evidence")
+        if not isinstance(evidence, list):
+            evidence = []
+        evidence.append("Interpreted null/empty row cleanup as a drop_nulls cleaning request.")
+        canonical_intent["evidence"] = _dedupe_preserve_order(evidence)
+
+        repair_notes = canonical_intent.get("repair_notes")
+        if not isinstance(repair_notes, list):
+            repair_notes = []
+        repair_notes.append("Repaired row-level null cleanup into an explicit clean(drop_nulls) action.")
+        canonical_intent["repair_notes"] = _dedupe_preserve_order(repair_notes)
 
     return canonical_intent
 
@@ -1474,6 +1616,7 @@ def _ground_filter_field_from_profile(
 
     requested_tokens = set(_normalize_reference(raw_reference).split())
     generic_reference = not requested_tokens or requested_tokens <= _GENERIC_FIELD_REFERENCES
+    generic_field_tokens = requested_tokens & _GENERIC_FIELD_REFERENCES
     value_strings = _flatten_filter_values(value)
     value_tokens = _value_tokens(value_strings)
     compact_values = {_compact_token(value_string) for value_string in value_strings if _compact_token(value_string)}
@@ -1494,13 +1637,20 @@ def _ground_filter_field_from_profile(
         for requested in value_strings:
             requested_normalized = _normalize_reference(requested)
             requested_compact = _compact_token(requested)
-            if requested_normalized and requested_normalized in observed_normalized:
+            matched_observed_value = None
+            if requested_normalized:
+                for observed in observed_values:
+                    if _normalize_reference(observed) == requested_normalized:
+                        matched_observed_value = observed
+                        break
+            if matched_observed_value is None and requested_compact:
+                for observed in observed_values:
+                    if _compact_token(observed) == requested_compact:
+                        matched_observed_value = observed
+                        break
+            if matched_observed_value is not None:
                 exact_value_matches += 1
-                matched_values.append(requested)
-                continue
-            if requested_compact and requested_compact in observed_compact:
-                exact_value_matches += 1
-                matched_values.append(requested)
+                matched_values.append(matched_observed_value)
 
         requested_value_count = len(value_strings)
         value_coverage = (exact_value_matches / requested_value_count) if requested_value_count else 0.0
@@ -1532,6 +1682,10 @@ def _ground_filter_field_from_profile(
             semantic_role_score += 0.20
         if observed_tokens & value_tokens:
             semantic_role_score += 0.10
+        if generic_field_tokens and any(token in column_normalized for token in generic_field_tokens):
+            semantic_role_score += 0.35
+        if generic_field_tokens and column_profile.get("semantic_type_hint") in generic_field_tokens:
+            semantic_role_score += 0.20
 
         column_name_similarity = 0.0
         if not generic_reference:
@@ -1553,6 +1707,8 @@ def _ground_filter_field_from_profile(
         type_compatibility_score = 0.0
         detected_type = detected_types.get(column, "")
         if requested_value_count:
+            if detected_type in {"string", "object", "category", ""}:
+                type_compatibility_score += 0.05
             if "payment" in value_concepts and detected_type in {"string", "object", "category", ""}:
                 type_compatibility_score += 0.10
             if "status" in value_concepts and detected_type in {"string", "object", "category", ""}:
@@ -1602,23 +1758,105 @@ def _ground_filter_field_from_profile(
     if not scored:
         return None
 
+    def _supports_value_resolution(candidate: _FilterFieldGroundingCandidate) -> bool:
+        if requested_value_count <= 0:
+            return False
+        if candidate.exact_value_matches <= 0:
+            return False
+        if requested_value_count == 1:
+            value_match = candidate.exact_value_matches >= 1
+        else:
+            value_match = candidate.exact_value_matches >= requested_value_count and candidate.value_coverage >= 1.0
+        semantic_match = candidate.semantic_role_score >= 0.35 or candidate.column_name_similarity >= 0.30
+        type_match = candidate.type_compatibility_score > 0
+        return value_match and semantic_match and type_match
+
+    supported_candidates = [candidate for candidate in scored if _supports_value_resolution(candidate)]
+
+    if requested_value_count > 0:
+        if len(supported_candidates) == 1:
+            best = supported_candidates[0]
+            try:
+                log_runtime_event(
+                    "profile_grounding_decision",
+                    service="backend",
+                    submission_id=submission_id,
+                    operator=operator,
+                    candidate_count=len(scored),
+                    requested_value_count=best.requested_value_count,
+                    exact_value_matches=best.exact_value_matches,
+                    value_coverage=round(best.value_coverage, 3),
+                    best_score=round(best.final_score, 3),
+                    second_score=0.0,
+                    resolution_reason=best.resolution_reason,
+                    generic_reference=generic_reference,
+                )
+            except Exception:
+                pass
+            grounded_value = best.observed_value_matches[0] if best.observed_value_matches else (value_strings[0] if value_strings else None)
+            return {
+                **field,
+                "resolved_column": best.column,
+                "resolved_columns": [best.column],
+                "grounded_value": grounded_value,
+                "candidate_columns": [candidate.column for candidate in supported_candidates],
+                "selection_mode": "single",
+                "resolution_method": "profile_value_evidence",
+                "evidence": _dedupe_preserve_order(
+                    list(field.get("evidence", []))
+                    + [
+                        f"profile_match={best.resolution_reason}",
+                        f"candidate_count={len(supported_candidates)}",
+                    ]
+                ),
+            }
+
+        if len(supported_candidates) > 1:
+            try:
+                log_runtime_event(
+                    "profile_grounding_decision",
+                    service="backend",
+                    submission_id=submission_id,
+                    operator=operator,
+                    candidate_count=len(scored),
+                    requested_value_count=supported_candidates[0].requested_value_count,
+                    exact_value_matches=supported_candidates[0].exact_value_matches,
+                    value_coverage=round(supported_candidates[0].value_coverage, 3),
+                    best_score=round(supported_candidates[0].final_score, 3),
+                    second_score=round(supported_candidates[1].final_score, 3),
+                    resolution_reason="ambiguous",
+                    generic_reference=generic_reference,
+                )
+            except Exception:
+                pass
+            return {
+                **field,
+                "resolved_column": None,
+                "resolved_columns": [],
+                "grounded_value": None,
+                "candidate_columns": [candidate.column for candidate in supported_candidates],
+                "selection_mode": "ambiguous",
+                "resolution_method": "profile_value_ambiguous",
+                "candidates": [
+                    {
+                        "column": candidate.column,
+                        "matched_value": candidate.observed_value_matches[0] if candidate.observed_value_matches else None,
+                    }
+                    for candidate in supported_candidates
+                ],
+                "evidence": _dedupe_preserve_order(
+                    list(field.get("evidence", []))
+                    + [
+                        "Multiple candidate columns matched the requested value evidence.",
+                        f"candidate_count={len(supported_candidates)}",
+                    ]
+                ),
+            }
+
     best = scored[0]
     second = scored[1] if len(scored) > 1 else None
 
-    decisive_value_match = (
-        best.requested_value_count > 0
-        and best.exact_value_matches > 0
-        and best.value_coverage >= 0.5
-        and best.final_score >= 0.45
-        and (second is None or best.exact_value_matches > second.exact_value_matches or (best.final_score - second.final_score) >= 0.10)
-    )
-    decisive_semantic_match = (
-        best.requested_value_count == 0
-        and best.final_score >= 0.60
-        and (second is None or (best.final_score - second.final_score) >= 0.15)
-    )
-
-    if decisive_value_match or decisive_semantic_match:
+    if requested_value_count > 0 and best.exact_value_matches > 0 and best.final_score >= 0.45:
         try:
             log_runtime_event(
                 "profile_grounding_decision",
@@ -1640,9 +1878,53 @@ def _ground_filter_field_from_profile(
             **field,
             "resolved_column": best.column,
             "resolved_columns": [best.column],
+            "grounded_value": best.observed_value_matches[0] if best.observed_value_matches else (value_strings[0] if value_strings else None),
             "candidate_columns": [candidate.column for candidate in scored[:3]],
             "selection_mode": "single",
-            "resolution_method": "profile_value_evidence" if decisive_value_match else "profile_semantic_match",
+            "resolution_method": "profile_value_evidence",
+            "evidence": _dedupe_preserve_order(
+                list(field.get("evidence", []))
+                + [
+                    f"profile_match={best.resolution_reason}",
+                    f"candidate_count={len(scored)}",
+                ]
+            ),
+        }
+
+    if requested_value_count > 0 and generic_reference and best.exact_value_matches == 0:
+        return None
+
+    decisive_semantic_match = (
+        best.final_score >= 0.60
+        and (second is None or (best.final_score - second.final_score) >= 0.15)
+    )
+
+    if decisive_semantic_match:
+        try:
+            log_runtime_event(
+                "profile_grounding_decision",
+                service="backend",
+                submission_id=submission_id,
+                operator=operator,
+                candidate_count=len(scored),
+                requested_value_count=best.requested_value_count,
+                exact_value_matches=best.exact_value_matches,
+                value_coverage=round(best.value_coverage, 3),
+                best_score=round(best.final_score, 3),
+                second_score=round(second.final_score, 3) if second else 0.0,
+                resolution_reason=best.resolution_reason,
+                generic_reference=generic_reference,
+            )
+        except Exception:
+            pass
+        return {
+            **field,
+            "resolved_column": best.column,
+            "resolved_columns": [best.column],
+            "grounded_value": best.observed_value_matches[0] if best.observed_value_matches else None,
+            "candidate_columns": [candidate.column for candidate in scored[:3]],
+            "selection_mode": "single",
+            "resolution_method": "profile_semantic_match",
             "evidence": _dedupe_preserve_order(
                 list(field.get("evidence", []))
                 + [
@@ -1670,13 +1952,14 @@ def _ground_filter_field_from_profile(
     except Exception:
         pass
 
-    if best.final_score < 0.45 or not decisive_value_match and (best.final_score - (second.final_score if second else 0.0)) < 0.10:
+    if best.final_score < 0.45:
         return None
 
     return {
         **field,
         "resolved_column": best.column,
         "resolved_columns": [best.column],
+        "grounded_value": best.observed_value_matches[0] if best.observed_value_matches else None,
         "candidate_columns": [candidate.column for candidate in scored[:3]],
         "selection_mode": "single",
         "resolution_method": "profile_semantic_match",
@@ -1879,19 +2162,27 @@ def _parse_filter_clause(
     )
     if contains_value_first:
         field_ref = _ground_column_reference(contains_value_first.group("field"), source_columns, role_columns)
-        if field_ref is None:
-            return None
         value = _coerce_filter_value(contains_value_first.group("value"))
-        operator = "in" if isinstance(value, list) and len(value) > 1 else "contains"
+        operator = "in" if isinstance(value, list) and len(value) > 1 else "eq"
+        if field_ref is None:
+            field_ref = UnresolvedColumnReference(
+                raw_reference=_strip_noise_tokens(contains_value_first.group("field")),
+                resolution_method="unresolved",
+                selection_mode="ambiguous" if _normalize_reference(contains_value_first.group("field")) else None,
+            )
         return FilterCondition(field=field_ref, operator=operator, value=value)
 
     value_first = re.match(r"^(?P<value>.+?)\s+as\s+(?:a\s+)?(?P<field>.+)$", clause, flags=re.IGNORECASE)
     if value_first:
         field_ref = _ground_column_reference(value_first.group("field"), source_columns, role_columns)
-        if field_ref is None:
-            return None
         value = _coerce_filter_value(value_first.group("value"))
         operator = "in" if isinstance(value, list) and len(value) > 1 else "eq"
+        if field_ref is None:
+            field_ref = UnresolvedColumnReference(
+                raw_reference=_strip_noise_tokens(value_first.group("field")),
+                resolution_method="unresolved",
+                selection_mode="ambiguous" if _normalize_reference(value_first.group("field")) else None,
+            )
         return FilterCondition(field=field_ref, operator=operator, value=value)
 
     for pattern, operator in (
@@ -1907,11 +2198,15 @@ def _parse_filter_clause(
         if not match:
             continue
         field_ref = _ground_column_reference(match.group("field"), source_columns, role_columns)
-        if field_ref is None:
-            continue
         value = _coerce_filter_value(match.group("value"))
         if isinstance(value, list) and len(value) > 1 and operator in {"eq", "contains"}:
             operator = "in"
+        if field_ref is None:
+            field_ref = UnresolvedColumnReference(
+                raw_reference=_strip_noise_tokens(match.group("field")),
+                resolution_method="unresolved",
+                selection_mode="ambiguous" if _normalize_reference(match.group("field")) else None,
+            )
         return FilterCondition(field=field_ref, operator=operator, value=value)
 
     # Bare "customer id 1002" or "status pending" style clauses.
@@ -1952,10 +2247,36 @@ def _ground_column_reference(
 
     exact_matches = alias_index.get(normalized_reference, [])
     if exact_matches:
+        unique_matches = _dedupe_preserve_order(exact_matches)
+        if len(unique_matches) == 1:
+            if generic_reference:
+                return UnresolvedColumnReference(
+                    raw_reference=raw_reference,
+                    resolution_method="alias_match",
+                    selection_mode="ambiguous",
+                    candidate_columns=unique_matches,
+                    evidence=[f"Alias {raw_reference!r} maps to a generic column candidate."],
+                )
+            return UnresolvedColumnReference(
+                raw_reference=raw_reference,
+                resolved_column=unique_matches[0],
+                resolution_method="exact_name" if normalize_semantic_name(raw_reference) == normalize_semantic_name(unique_matches[0]) else "alias_match",
+            )
+        if generic_reference:
+            return UnresolvedColumnReference(
+                raw_reference=raw_reference,
+                resolution_method="alias_match",
+                selection_mode="ambiguous",
+                candidate_columns=unique_matches,
+                evidence=[f"Alias {raw_reference!r} matches multiple columns."],
+            )
         return UnresolvedColumnReference(
             raw_reference=raw_reference,
-            resolved_column=exact_matches[0],
-            resolution_method="exact_name" if normalize_semantic_name(raw_reference) == normalize_semantic_name(exact_matches[0]) else "alias_match",
+            resolution_method="alias_match",
+            selection_mode="ambiguous",
+            candidate_columns=unique_matches,
+            resolved_columns=[],
+            evidence=[f"Alias {raw_reference!r} matches multiple columns."],
         )
 
     if role_columns is None:
@@ -2208,7 +2529,17 @@ def upcast_canonical_intent_payload(payload: dict[str, Any] | None) -> dict[str,
 def _build_decision_summary(actions: list[IntentAction]) -> str:
     if not actions:
         return ""
-    return " + ".join(action.kind for action in actions if isinstance(action, BaseModel)) or ""
+    parts: list[str] = []
+    for action in actions:
+        if isinstance(action, BaseModel):
+            kind = getattr(action, "kind", "")
+        elif isinstance(action, dict):
+            kind = str(action.get("kind", "")).strip()
+        else:
+            kind = ""
+        if kind:
+            parts.append(str(kind))
+    return " + ".join(parts) if parts else ""
 
 
 def _build_column_alias_index(source_columns: list[str]) -> dict[str, list[str]]:
@@ -2310,6 +2641,7 @@ def _remove_column_reference(text: str, reference: str) -> str:
 
 
 def _split_filter_clauses(text: str) -> tuple[list[str], list[str]]:
+    text = re.sub(r"\s*,\s*", " and ", text)
     clauses: list[str] = []
     connectors: list[str] = []
     buffer: list[str] = []

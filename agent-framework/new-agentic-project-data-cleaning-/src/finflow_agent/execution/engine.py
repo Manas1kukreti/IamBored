@@ -686,8 +686,28 @@ class ExecutionEngine:
                     raise Exception(str(exc))
 
                 # 3. Invoke the agent.
+                # If the agent raises instead of returning an AgentResult,
+                # record the current step as failed before bubbling the
+                # exception so the outer summary reports the real step.
                 agent_instance = agent_cls()
-                result: AgentResult = agent_instance.execute(params, input_data)
+                try:
+                    result: AgentResult = agent_instance.execute(params, input_data)
+                except Exception as exc:
+                    message = (
+                        f"Unhandled exception in step '{step_id}' "
+                        f"(agent={agent_name}): {exc}"
+                    )
+                    engine.step_results[step_id] = {
+                        "agent": agent_name,
+                        "status": "failed",
+                        "summary": None,
+                        "metrics": {},
+                        "operations_applied": [],
+                        "warnings": [],
+                        "artifacts": {},
+                        "error_message": message,
+                    }
+                    raise Exception(message) from exc
 
                 # 4. Record telemetry BEFORE any failure raises so the
                 #    failed-step lookup at the bottom is deterministic

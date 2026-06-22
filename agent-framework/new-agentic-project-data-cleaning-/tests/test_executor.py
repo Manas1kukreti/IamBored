@@ -10,6 +10,7 @@ from finflow_agent.operations.schemas import (
     TrimWhitespaceOperation,
     DropDuplicatesOperation,
     FillNullsOperation,
+    DropNullsOperation,
     FilterOperationPlan,
     FilterCondition,
     CalculationOperationPlan,
@@ -52,6 +53,28 @@ def test_execute_cleaning_plan():
     
     assert len(output.operations_applied) == 4
     print("Cleaning execution test passed.")
+
+
+def test_execute_drop_nulls_treats_empty_strings_as_missing():
+    df = pd.DataFrame({
+        "gender": ["Female", "Male", "Female"],
+        "education_level": ["PhD", "Master", ""],
+        "marital_status": ["Single", None, "Single"],
+    })
+
+    plan = CleaningOperationPlan(
+        operations=[
+            DropNullsOperation(columns=None, how="any"),
+        ]
+    )
+
+    output = execute_cleaning_plan(df, plan)
+    clean_df = output.data
+
+    assert len(clean_df) == 1
+    assert clean_df.iloc[0]["gender"] == "Female"
+    assert clean_df.iloc[0]["education_level"] == "PhD"
+    assert clean_df.iloc[0]["marital_status"] == "Single"
 
 def test_execute_filter_plan():
     df = pd.DataFrame({

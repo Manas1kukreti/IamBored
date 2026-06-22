@@ -7,6 +7,8 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "../s
 
 from finflow_agent.planning.canonical_intent import (
     CanonicalIntent,
+    CleanIntent,
+    CleaningIntentOperation,
     ProjectColumnsIntent,
     UnresolvedColumnReference,
 )
@@ -85,3 +87,38 @@ def test_compile_canonical_intent_rejects_unresolved_projection():
             output_dir="outputs",
             artifact_prefix="submission_test",
         )
+
+
+def test_compile_canonical_intent_maps_drop_nulls_cleaning_operation():
+    intent = CanonicalIntent(
+        schema_version="2.0",
+        resolution_status="resolved",
+        output_format="xlsx",
+        dataframe_profile={"source_columns": ["gender", "education_level", "marital_status", "age"]},
+        actions=[
+            CleanIntent(
+                kind="clean",
+                mode="explicit",
+                operations=[
+                    CleaningIntentOperation(
+                        name="drop_nulls",
+                        parameters={"columns": None, "how": "any"},
+                    )
+                ],
+            )
+        ],
+    )
+
+    plan = compile_canonical_intent(
+        intent,
+        resolved_file_path="ignored.csv",
+        file_type="csv",
+        output_dir="outputs",
+        artifact_prefix="submission_test",
+    )
+
+    clean_step = next(step for step in plan.steps if step.step_id == "clean")
+    operations = clean_step.params["plan"]["operations"]
+    assert operations[0]["type"] == "drop_nulls"
+    assert operations[0]["columns"] is None
+    assert operations[0]["how"] == "any"

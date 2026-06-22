@@ -5,6 +5,7 @@ from __future__ import annotations
 from copy import deepcopy
 from datetime import datetime, timezone
 from enum import Enum
+import re
 from typing import Any, Dict, List, Optional
 
 from pydantic import BaseModel, Field
@@ -81,16 +82,24 @@ class IntentPackage(BaseModel):
             self.version_key = f"{self.submission_id}:v{self.version}"
 
     def get_resolved_column(self, requested_field: str) -> Optional[ResolvedColumn]:
+        requested_key = _normalize_lookup_key(requested_field)
         for rc in self.resolved_columns:
-            if rc.requested_field == requested_field:
+            if _normalize_lookup_key(rc.requested_field) == requested_key:
+                return rc
+        for rc in self.resolved_columns:
+            if _normalize_lookup_key(rc.resolved_column) == requested_key:
                 return rc
         return None
 
     def get_grounded_clause(self, requested_field: str) -> Optional[GroundedFilterClause]:
+        requested_key = _normalize_lookup_key(requested_field)
         if self.grounding_result is None:
             return None
         for clause in self.grounding_result.grounded_clauses:
-            if clause.requested_field == requested_field:
+            if _normalize_lookup_key(clause.requested_field) == requested_key:
+                return clause
+        for clause in self.grounding_result.grounded_clauses:
+            if _normalize_lookup_key(clause.resolved_column) == requested_key:
                 return clause
         return None
 
@@ -202,3 +211,8 @@ class IntentPackage(BaseModel):
             violations=[],
             quarantine_reason=None,
         )
+
+
+def _normalize_lookup_key(value: str | None) -> str:
+    """Normalize lookup keys so raw references and physical names can match."""
+    return re.sub(r"[^a-z0-9]+", "_", str(value or "").strip().lower()).strip("_")

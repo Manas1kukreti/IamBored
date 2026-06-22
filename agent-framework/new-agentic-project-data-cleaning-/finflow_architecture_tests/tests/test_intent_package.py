@@ -151,6 +151,24 @@ def test_intent_package_get_resolved_column():
     assert pkg.has_resolution_for("gender")
 
 
+def test_intent_package_get_resolved_column_matches_physical_name():
+    """Lookup should also work when callers ask by the physical column name."""
+    rc = ResolvedColumn(
+        requested_field="education",
+        resolved_column="education_level",
+        confidence=1.0,
+        resolution_method=ResolutionMethod.EXACT,
+        reason="grounded by semantic field",
+    )
+    pkg = _make_package(resolved=[rc])
+
+    found = pkg.get_resolved_column("education_level")
+    assert found is not None
+    assert found.requested_field == "education"
+    assert found.resolved_column == "education_level"
+    assert pkg.has_resolution_for("education_level")
+
+
 # ---------------------------------------------------------------------------
 # 4. Patch increments version
 # ---------------------------------------------------------------------------

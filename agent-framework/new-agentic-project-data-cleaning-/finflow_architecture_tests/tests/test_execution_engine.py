@@ -361,6 +361,66 @@ def test_engine_stops_on_failed_step(bootstrap_agents):
     assert SinkAgent.invocations == []
 
 
+def test_engine_attributes_thrown_agent_exceptions_to_the_failing_step(
+    bootstrap_agents,
+):
+    """If ``agent.execute`` raises, the engine must attribute the failure
+    to that step instead of falling back to the first step."""
+    df_payload = pd.DataFrame({"x": [1, 2, 3]})
+
+    ingest_name = _fake_name("test_throwing_ingest")
+    explode_name = _fake_name("test_throwing_explode")
+
+    class IngestAgent:
+        spec = AgentSpec(
+            name=ingest_name,
+            description="ok ingest",
+            stage="ingest",
+            accepts=["file"],
+            produces=["dataframe"],
+            params_schema={},
+        )
+
+        def execute(self, params, input_data):
+            return AgentResult(status="success", data=df_payload)
+
+    class ExplodingAgent:
+        spec = AgentSpec(
+            name=explode_name,
+            description="raises during execution",
+            stage="transform",
+            accepts=["dataframe"],
+            produces=["dataframe"],
+            params_schema={},
+        )
+
+        def execute(self, params, input_data):
+            raise RuntimeError("boom during execute")
+
+    with _registered_agent(IngestAgent), _registered_agent(ExplodingAgent):
+        plan = ExecutionPlan(
+            steps=[
+                _build_envelope_step("ingest", ingest_name, output_key="df_ingested"),
+                _build_envelope_step(
+                    "explode",
+                    explode_name,
+                    depends_on=["ingest"],
+                    input_from=["df_ingested"],
+                    output_key="df_exploded",
+                ),
+            ]
+        )
+
+        result = ExecutionEngine().execute(plan)
+
+    assert result["status"] == "failed"
+    summary = result["summary"]
+    assert summary["failed_step_id"] == "explode"
+    assert "Unhandled exception in step 'explode'" in summary["error_message"]
+    assert "boom during execute" in summary["error_message"]
+    assert summary["step_statuses"]["explode"] == "failed"
+
+
 # ---------------------------------------------------------------------------
 # 4. Stop on partial
 # ---------------------------------------------------------------------------

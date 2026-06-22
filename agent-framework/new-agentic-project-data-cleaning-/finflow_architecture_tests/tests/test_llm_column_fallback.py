@@ -21,6 +21,7 @@ from finflow_agent.tools.column_resolver import (
     _LLMColumnChoice,
 )
 from finflow_agent.tools.dataframe_profile import profile_dataframe
+from finflow_agent.planning.package_builder import build_intent_package
 from finflow_agent.tools.predicate_grounder import LLMGroundingDecision
 
 
@@ -199,3 +200,51 @@ def test_filter_agent_succeeds_with_llm_resolved_column(bootstrap_agents):
     assert mapping[0]["matched_column"] == "beta"
     assert mapping[0]["confidence"] >= 0.91
     assert "semantic grounding (llm)" in mapping[0]["reason"]
+
+
+def test_unresolved_semantic_field_can_still_use_llm_fallback():
+    from finflow_agent.operations.schemas import FilterOperationPlan
+    from finflow_agent.tools.dataframe_profile import profile_dataframe
+
+    profile = profile_dataframe(
+        pd.DataFrame(
+            {
+                "education_level": ["Master"],
+                "reference_code": ["REF001"],
+                "amount": [1500.00],
+            }
+        ),
+        include_samples=False,
+    )
+
+    plan = FilterOperationPlan.model_validate(
+        {
+            "conditions": [
+                {
+                    "column": "qualification",
+                    "operator": "eq",
+                    "value": "abc",
+                }
+            ],
+            "logic": "and",
+        }
+    )
+
+    with patch(
+        "finflow_agent.tools.predicate_grounder._llm_ground_clause",
+        return_value=LLMGroundingDecision(
+            selected_column="education_level",
+            reason="qualification maps to education_level",
+            confidence=0.88,
+        ),
+    ) as mock_llm:
+        pkg = build_intent_package(
+            submission_id="llm-fallback",
+            filter_plan=plan,
+            profile=profile,
+        )
+
+    assert mock_llm.call_count == 1
+    assert pkg.status.value in {"valid", "needs_review"}
+    assert pkg.resolved_columns
+    assert pkg.resolved_columns[0].resolved_column == "education_level"

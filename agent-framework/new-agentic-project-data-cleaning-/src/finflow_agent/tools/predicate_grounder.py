@@ -17,6 +17,7 @@ import pandas as pd
 from pydantic import BaseModel, Field
 
 from finflow_agent.llm import get_chat_groq
+from finflow_agent.llm_telemetry import log_runtime_event
 from finflow_agent.tools.column_resolver import CONFIDENCE_THRESHOLD
 from finflow_agent.tools.dataframe_profile import DataFrameProfile
 from finflow_agent.tools.semantic_column_profiler import (
@@ -89,6 +90,42 @@ _IDENTIFIER_VALUE_HINTS = frozenset(
         "transaction",
     }
 )
+
+_OPERATOR_ALIASES = {
+    "==": "eq",
+    "=": "eq",
+    "equals": "eq",
+    "equal": "eq",
+    "!=": "neq",
+    "<>": "neq",
+    "ne": "neq",
+    "not_equal": "neq",
+    "not_equals": "neq",
+    ">": "gt",
+    "gt": "gt",
+    "greater": "gt",
+    "greater_than": "gt",
+    ">=": "gte",
+    "gte": "gte",
+    "ge": "gte",
+    "greater_equal": "gte",
+    "greater_than_or_equal": "gte",
+    "<": "lt",
+    "lt": "lt",
+    "less": "lt",
+    "less_than": "lt",
+    "<=": "lte",
+    "lte": "lte",
+    "le": "lte",
+    "less_equal": "lte",
+    "less_than_or_equal": "lte",
+    "one_of": "in",
+    "not in": "not_in",
+    "nin": "not_in",
+    "isnull": "is_null",
+    "null": "is_null",
+    "notnull": "is_not_null",
+}
 
 
 class UnresolvedFilterClause(BaseModel):
@@ -194,6 +231,60 @@ def _field_tokens(requested_field: str) -> set[str]:
     if field.startswith("__") and field.endswith("_column__"):
         field = field[2:-9]
     return _tokenize(field)
+
+
+def _normalize_column_key(value: str) -> str:
+    return _normalize_text(value).replace(" ", "_")
+
+
+def _map_operator(raw_operator: Any) -> str:
+    operator = str(getattr(raw_operator, "value", raw_operator) or "").strip().lower()
+    return _OPERATOR_ALIASES.get(operator, operator)
+
+
+def _match_physical_column(
+    requested_field: str,
+    semantic_profiles: list[SemanticColumnProfile],
+) -> Optional[str]:
+    if not requested_field:
+        return None
+
+    requested_normalized = _normalize_column_key(requested_field)
+    for semantic in semantic_profiles:
+        column_normalized = _normalize_column_key(semantic.column)
+        if requested_field.strip().lower() == semantic.column.strip().lower():
+            return semantic.column
+        if requested_normalized == column_normalized:
+            return semantic.column
+    return None
+
+
+def _log_grounding_decision(
+    *,
+    requested_field: str,
+    physical_column: Optional[str],
+    resolved_column: Optional[str],
+    available_dataframe_columns: list[str],
+    grounding_path_selected: str,
+    llm_fallback_reason: str,
+    llm_called: bool,
+) -> None:
+    try:
+        log_runtime_event(
+            "predicate_grounding_decision",
+            service="agent-service",
+            trigger="worker",
+            requested_field=requested_field,
+            semantic_field=requested_field,
+            physical_column=physical_column,
+            resolved_column=resolved_column,
+            available_dataframe_columns=available_dataframe_columns,
+            grounding_path_selected=grounding_path_selected,
+            llm_fallback_reason=llm_fallback_reason,
+            llm_called=llm_called,
+        )
+    except Exception:
+        pass
 
 
 def _score_candidate(
@@ -470,6 +561,63 @@ def _ground_single_clause(
     clause: UnresolvedFilterClause,
     semantic_profiles: list[SemanticColumnProfile],
 ) -> tuple[Optional[GroundedFilterClause], list[GroundingCandidate], str | None]:
+    available_columns = [semantic.column for semantic in semantic_profiles]
+    physical_column = _match_physical_column(clause.requested_field, semantic_profiles)
+    if physical_column is not None:
+        _log_grounding_decision(
+            requested_field=clause.requested_field,
+            physical_column=physical_column,
+            resolved_column=physical_column,
+            available_dataframe_columns=available_columns,
+            grounding_path_selected="canonical_physical_column",
+            llm_fallback_reason="not_needed",
+            llm_called=False,
+        )
+        return (
+            GroundedFilterClause(
+                requested_field=clause.requested_field,
+                resolved_column=physical_column,
+                operator=_map_operator(clause.operator),
+                value=clause.value,
+                value_to=clause.value_to,
+                case_sensitive=clause.case_sensitive,
+                confidence=1.0,
+                grounding_method="deterministic",
+                positive_evidence=["requested field already matches an existing physical column"],
+                candidate_scores=[
+                    GroundingCandidate(
+                        column=physical_column,
+                        score=1.0,
+                        broad_type=next(
+                            (
+                                semantic.broad_type
+                                for semantic in semantic_profiles
+                                if semantic.column == physical_column
+                            ),
+                            BroadSemanticType.unknown,
+                        ),
+                        positive_evidence=["physical column match"],
+                        semantic_tags=[],
+                    )
+                ],
+            ),
+            [GroundingCandidate(
+                column=physical_column,
+                score=1.0,
+                broad_type=next(
+                    (
+                        semantic.broad_type
+                        for semantic in semantic_profiles
+                        if semantic.column == physical_column
+                    ),
+                    BroadSemanticType.unknown,
+                ),
+                positive_evidence=["physical column match"],
+                semantic_tags=[],
+            )],
+            None,
+        )
+
     candidate_scores = [_score_candidate(clause, semantic) for semantic in semantic_profiles]
     candidate_scores.sort(key=lambda item: item.score, reverse=True)
     if not candidate_scores:
@@ -483,6 +631,15 @@ def _ground_single_clause(
     )
 
     if ambiguous:
+        _log_grounding_decision(
+            requested_field=clause.requested_field,
+            physical_column=None,
+            resolved_column=None,
+            available_dataframe_columns=available_columns,
+            grounding_path_selected="llm_fallback",
+            llm_fallback_reason="ambiguous semantic grounding",
+            llm_called=True,
+        )
         llm_decision = _llm_ground_clause(
             clause=clause,
             semantic_profiles=semantic_profiles,
@@ -498,7 +655,7 @@ def _ground_single_clause(
                     GroundedFilterClause(
                         requested_field=clause.requested_field,
                         resolved_column=selected.column,
-                        operator=clause.operator,
+                        operator=_map_operator(clause.operator),
                         value=clause.value,
                         value_to=clause.value_to,
                         case_sensitive=clause.case_sensitive,
@@ -520,7 +677,7 @@ def _ground_single_clause(
         GroundedFilterClause(
             requested_field=clause.requested_field,
             resolved_column=best.column,
-            operator=clause.operator,
+            operator=_map_operator(clause.operator),
             value=clause.value,
             value_to=clause.value_to,
             case_sensitive=clause.case_sensitive,

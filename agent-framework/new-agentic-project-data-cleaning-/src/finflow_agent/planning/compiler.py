@@ -47,9 +47,11 @@ from finflow_agent.contract_registry import (
 from finflow_agent.operations.schemas import (
     CleaningOperationPlan,
     DropDuplicatesOperation,
+    DropNullsOperation,
     FilterCondition,
     FilterOperationPlan,
     NormalizeColumnNamesOperation,
+    RemoveEmptyRowsOperation,
     TrimWhitespaceOperation,
 )
 from finflow_agent.planning.canonical_intent import (
@@ -696,6 +698,14 @@ def _build_cleaning_plan(action: CleanIntent) -> CleaningOperationPlan:
             operations.append(NormalizeColumnNamesOperation(style="snake_case"))
         elif name == "drop_duplicates":
             operations.append(DropDuplicatesOperation(subset=None, keep="first"))
+        elif name == "drop_nulls":
+            columns = operation.parameters.get("columns") if isinstance(operation.parameters, dict) else None
+            how = str(operation.parameters.get("how", "any")).strip().lower() if isinstance(operation.parameters, dict) else "any"
+            if columns is not None and not isinstance(columns, list):
+                raise ValueError("drop_nulls cleaning operation requires columns to be null or a list of column names.")
+            operations.append(DropNullsOperation(columns=columns, how=how if how in {"any", "all"} else "any"))
+        elif name == "remove_empty_rows":
+            operations.append(RemoveEmptyRowsOperation())
         else:
             raise ValueError(f"Unsupported canonical cleaning operation: {name!r}")
     return CleaningOperationPlan(operations=operations)

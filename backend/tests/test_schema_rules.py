@@ -320,6 +320,302 @@ def test_canonical_intent_grounds_payment_field_from_observed_values(monkeypatch
     assert result["resolution_status"] == "repaired"
 
 
+def test_canonical_intent_grounds_marital_status_from_value_evidence():
+    columns = ["gender", "education_level", "marital_status"]
+    preview_rows = [
+        {
+            "gender": "Female",
+            "education_level": "PhD",
+            "marital_status": "Single",
+        },
+        {
+            "gender": "Male",
+            "education_level": "Master",
+            "marital_status": "Married",
+        },
+        {
+            "gender": "Female",
+            "education_level": "PhD",
+            "marital_status": "Divorced",
+        },
+    ]
+
+    result = build_canonical_intent(
+        columns,
+        preview_rows,
+        "Clean the data and extract rows which contains female as gender, phd as education and single as status",
+        detected_types={
+            "gender": "string",
+            "education_level": "string",
+            "marital_status": "string",
+        },
+    )
+
+    filter_action = next(action for action in result["actions"] if action["kind"] == "filter_rows")
+    predicates = filter_action["conditions"]
+
+    resolved = {predicate["field"]["resolved_column"]: predicate["value"] for predicate in predicates}
+    assert resolved["gender"] == "female"
+    assert resolved["education_level"] == "phd"
+    assert resolved["marital_status"] == "single"
+    assert result["resolution_status"] in {"resolved", "repaired"}
+
+
+def test_canonical_intent_treats_null_row_cleanup_as_clean_not_drop_columns():
+    columns = ["gender", "education_level", "marital_status", "age"]
+    preview_rows = [
+        {"gender": "Female", "education_level": "PhD", "marital_status": "Single", "age": 30},
+        {"gender": "Male", "education_level": "Master", "marital_status": None, "age": 41},
+        {"gender": "Female", "education_level": "PhD", "marital_status": "Single", "age": ""},
+    ]
+
+    result = build_canonical_intent(
+        columns,
+        preview_rows,
+        "Clean this data and only return rows which contains female as gender, phd as education and single as status also drops the rows which has any field as empty or null",
+        detected_types={
+            "gender": "string",
+            "education_level": "string",
+            "marital_status": "string",
+            "age": "number",
+        },
+    )
+
+    kinds = [action["kind"] for action in result["actions"]]
+    assert "drop_columns" not in kinds
+    assert kinds[0] == "clean"
+    assert kinds[1] == "filter_rows"
+
+    clean_action = result["actions"][0]
+    operations = clean_action["operations"]
+    assert any(op["name"] == "drop_nulls" for op in operations)
+    drop_nulls_op = next(op for op in operations if op["name"] == "drop_nulls")
+    assert drop_nulls_op["parameters"] == {"columns": None, "how": "any"}
+
+    filter_action = result["actions"][1]
+    resolved = {predicate["field"]["resolved_column"]: predicate["value"] for predicate in filter_action["conditions"]}
+    assert resolved["gender"] == "female"
+    assert resolved["education_level"] == "phd"
+    assert resolved["marital_status"] == "single"
+    assert result["resolution_status"] in {"resolved", "repaired"}
+
+
+def test_canonical_intent_grounds_status_to_marital_status_amid_multiple_status_columns():
+    columns = ["gender", "education_level", "employment_status", "marital_status"]
+    preview_rows = [
+        {
+            "gender": "Male",
+            "education_level": "Master",
+            "employment_status": "Full-time",
+            "marital_status": "Married",
+        },
+        {
+            "gender": "Female",
+            "education_level": "PhD",
+            "employment_status": "Part-time",
+            "marital_status": "Single",
+        },
+    ]
+
+    result = build_canonical_intent(
+        columns,
+        preview_rows,
+        "Clean the data and extract rows which contains female as gender, phd as education and single as status",
+        detected_types={
+            "gender": "string",
+            "education_level": "string",
+            "employment_status": "string",
+            "marital_status": "string",
+        },
+    )
+
+    filter_action = next(action for action in result["actions"] if action["kind"] == "filter_rows")
+    predicates = filter_action["conditions"]
+
+    resolved = {predicate["field"]["resolved_column"]: predicate["value"] for predicate in predicates}
+    assert resolved["gender"] == "female"
+    assert resolved["education_level"] == "phd"
+    assert resolved["marital_status"] == "single"
+    assert "employment_status" not in resolved
+    assert result["resolution_status"] in {"resolved", "repaired"}
+
+
+def test_canonical_intent_marks_status_ambiguous_when_two_columns_match_single():
+    columns = ["gender", "education_level", "employment_status", "marital_status"]
+    preview_rows = [
+        {
+            "gender": "Male",
+            "education_level": "Master",
+            "employment_status": "Single",
+            "marital_status": "Single",
+        },
+        {
+            "gender": "Female",
+            "education_level": "PhD",
+            "employment_status": "Multiple",
+            "marital_status": "Married",
+        },
+    ]
+
+    result = build_canonical_intent(
+        columns,
+        preview_rows,
+        "return rows where status is single",
+        detected_types={
+            "gender": "string",
+            "education_level": "string",
+            "employment_status": "string",
+            "marital_status": "string",
+        },
+    )
+
+    filter_action = next(action for action in result["actions"] if action["kind"] == "filter_rows")
+    condition = filter_action["conditions"][0]
+
+    assert condition["field"]["selection_mode"] == "ambiguous"
+    assert set(condition["field"]["candidate_columns"]) == {"employment_status", "marital_status"}
+    assert condition["field"]["resolved_column"] is None
+    assert result["resolution_status"] == "needs_clarification"
+
+
+def test_canonical_intent_does_not_override_ambiguity_with_exact_status_column():
+    columns = ["status", "marital_status"]
+    preview_rows = [
+        {"status": "Single", "marital_status": "Single"},
+        {"status": "Multiple", "marital_status": "Married"},
+    ]
+
+    result = build_canonical_intent(
+        columns,
+        preview_rows,
+        "return rows where status is single",
+        detected_types={
+            "status": "string",
+            "marital_status": "string",
+        },
+    )
+
+    filter_action = next(action for action in result["actions"] if action["kind"] == "filter_rows")
+    condition = filter_action["conditions"][0]
+
+    assert condition["field"]["selection_mode"] == "ambiguous"
+    assert set(condition["field"]["candidate_columns"]) == {"status", "marital_status"}
+    assert condition["field"]["resolved_column"] is None
+    assert result["resolution_status"] == "needs_clarification"
+
+
+def test_canonical_intent_returns_needs_clarification_without_value_evidence():
+    columns = ["gender", "education_level", "employment_status", "marital_status"]
+    preview_rows = [
+        {
+            "gender": "Male",
+            "education_level": "Master",
+            "employment_status": "Active",
+            "marital_status": "Married",
+        },
+        {
+            "gender": "Female",
+            "education_level": "PhD",
+            "employment_status": "Inactive",
+            "marital_status": "Divorced",
+        },
+    ]
+
+    result = build_canonical_intent(
+        columns,
+        preview_rows,
+        "return rows where status is single",
+        detected_types={
+            "gender": "string",
+            "education_level": "string",
+            "employment_status": "string",
+            "marital_status": "string",
+        },
+    )
+
+    filter_action = next(action for action in result["actions"] if action["kind"] == "filter_rows")
+    condition = filter_action["conditions"][0]
+
+    assert condition["field"].get("resolved_column") is None
+    assert result["resolution_status"] == "needs_clarification"
+
+
+def test_canonical_intent_normalizes_status_value_case():
+    columns = ["gender", "education_level", "marital_status"]
+    preview_rows = [
+        {
+            "gender": "Female",
+            "education_level": "PhD",
+            "marital_status": "SINGLE",
+        },
+        {
+            "gender": "Male",
+            "education_level": "Master",
+            "marital_status": "MARRIED",
+        },
+    ]
+
+    result = build_canonical_intent(
+        columns,
+        preview_rows,
+        "return rows where status is single",
+        detected_types={
+            "gender": "string",
+            "education_level": "string",
+            "marital_status": "string",
+        },
+    )
+
+    filter_action = next(action for action in result["actions"] if action["kind"] == "filter_rows")
+    condition = filter_action["conditions"][0]
+
+    assert condition["field"]["resolved_column"] == "marital_status"
+    assert condition["field"]["grounded_value"] == "SINGLE"
+    assert result["resolution_status"] in {"resolved", "repaired"}
+
+
+def test_canonical_intent_full_prompt_ambiguous_status_needs_clarification():
+    columns = ["gender", "education_level", "employment_status", "marital_status"]
+    preview_rows = [
+        {
+            "gender": "Female",
+            "education_level": "PhD",
+            "employment_status": "Single",
+            "marital_status": "Single",
+        },
+        {
+            "gender": "Male",
+            "education_level": "Master",
+            "employment_status": "Multiple",
+            "marital_status": "Married",
+        },
+    ]
+
+    result = build_canonical_intent(
+        columns,
+        preview_rows,
+        "Clean this data and only return rows which contains female as gender, phd as education and single as status",
+        detected_types={
+            "gender": "string",
+            "education_level": "string",
+            "employment_status": "string",
+            "marital_status": "string",
+        },
+    )
+
+    filter_action = next(action for action in result["actions"] if action["kind"] == "filter_rows")
+    predicates = filter_action["conditions"]
+
+    resolved = [predicate["field"].get("resolved_column") for predicate in predicates]
+    ambiguous = [predicate["field"] for predicate in predicates if predicate["field"].get("selection_mode") == "ambiguous"]
+
+    assert "gender" in resolved
+    assert "education_level" in resolved
+    assert ambiguous
+    assert set(ambiguous[0]["candidate_columns"]) == {"employment_status", "marital_status"}
+    assert result["resolution_status"] == "needs_clarification"
+
+
 def test_canonical_intent_normalizes_membership_filter_without_bridge(monkeypatch):
     monkeypatch.delenv("GROQ_API_KEY", raising=False)
     monkeypatch.delenv("GROQ_BRIDGE_API_KEY", raising=False)

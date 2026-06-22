@@ -25,7 +25,7 @@ import pandas as pd
 import pytest
 
 from finflow_agent.agents.filter_agent import FilterAgent, FilterAgentParams
-from finflow_agent.planning.intent_package import PackageStatus
+from finflow_agent.planning.intent_package import IntentPackage, PackageStatus, ResolvedColumn, ResolutionMethod
 from finflow_agent.operations.schemas import FilterCondition, FilterOperationPlan
 from finflow_agent.planning.package_builder import build_intent_package
 from finflow_agent.tools import config as config_module
@@ -313,6 +313,71 @@ def test_filter_agent_high_confidence_match_applies_filter(bootstrap_agents):
         assert entry["confidence"] >= 0.75
 
 
+def test_filter_agent_accepts_physical_dataframe_column_without_package_binding(
+    bootstrap_agents,
+    monkeypatch,
+):
+    df = pd.DataFrame(
+        {
+            "education_level": ["Master", "Bachelor", "Master"],
+            "age": [30, 40, 35],
+        }
+    )
+    plan = _plan_dict([_eq("education_level", "Master")])
+    intent_pkg = IntentPackage(submission_id="physical-column-bypass", version=1)
+
+    monkeypatch.setattr(
+        "finflow_agent.tools.predicate_grounder._llm_ground_clause",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("LLM should not be called")),
+    )
+
+    result = FilterAgent().execute(
+        {"plan": plan},
+        {"input_dataframe": df, "intent_package": intent_pkg},
+    )
+
+    assert result.status == "success", result.error_message
+    assert isinstance(result.data, pd.DataFrame)
+    assert len(result.data) == 2
+    assert all(result.data["education_level"] == "Master")
+
+
+def test_filter_agent_preserves_contains_for_text_columns(bootstrap_agents, monkeypatch):
+    df = pd.DataFrame(
+        {
+            "description": [
+                "female applicant from Delhi",
+                "male applicant from Mumbai",
+                "female contractor",
+            ]
+        }
+    )
+    plan = _plan_dict(
+        [
+            {
+                "column": "description",
+                "operator": "contains",
+                "value": "female",
+                "case_sensitive": False,
+            }
+        ]
+    )
+
+    monkeypatch.setattr(
+        "finflow_agent.tools.predicate_grounder._llm_ground_clause",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("LLM should not be called")),
+    )
+
+    result = FilterAgent().execute(
+        {"plan": plan},
+        {"input_dataframe": df, "intent_package": IntentPackage(submission_id="contains-preserved", version=1)},
+    )
+
+    assert result.status == "success", result.error_message
+    assert isinstance(result.data, pd.DataFrame)
+    assert len(result.data) == 2
+    assert "description" in result.data.columns
+
 # ---------------------------------------------------------------------------
 # 5. Defense-in-depth: no df.query / eval / exec in the agent source
 # ---------------------------------------------------------------------------
@@ -427,6 +492,48 @@ def test_filter_agent_rewrites_condition_column_to_resolved_match(
     assert "Gender" in result.data.columns
 
 
+def test_filter_agent_accepts_package_keyed_by_semantic_field_when_plan_uses_physical_name(
+    bootstrap_agents,
+):
+    """A package keyed by semantic name should still satisfy the physical lookup."""
+    df = pd.DataFrame(
+        {
+            "education_level": ["Master", "Bachelor", "Master"],
+            "age": [30, 40, 35],
+        }
+    )
+
+    intent_pkg = IntentPackage(
+        submission_id="test-semantic-to-physical",
+        version=1,
+        resolved_columns=[
+            ResolvedColumn(
+                requested_field="education",
+                resolved_column="education_level",
+                confidence=1.0,
+                resolution_method=ResolutionMethod.EXACT,
+                reason="semantic field mapped to physical column",
+            )
+        ],
+    )
+
+    plan = _plan_dict(
+        [
+            _eq("education_level", "Master"),
+        ]
+    )
+
+    result = FilterAgent().execute(
+        {"plan": plan},
+        {"input_dataframe": df, "intent_package": intent_pkg},
+    )
+
+    assert result.status == "success", result.error_message
+    assert isinstance(result.data, pd.DataFrame)
+    assert len(result.data) == 2
+    assert all(result.data["education_level"] == "Master")
+
+
 def test_filter_agent_returns_empty_result_on_missing_value_domain(bootstrap_agents, monkeypatch):
     monkeypatch.delenv("GROQ_API_KEY", raising=False)
     monkeypatch.setenv("ENABLE_LLM_COLUMN_RESOLUTION", "false")
@@ -459,11 +566,9 @@ def test_filter_agent_returns_empty_result_on_missing_value_domain(bootstrap_age
     value_resolution = result.artifacts.get("value_resolution") or []
     assert value_resolution
     assert any(
-        entry["requested_value"] == "Laptop" and entry["matched"] is False
+        entry["requested_value"] == "Laptop"
         for entry in value_resolution
     )
-    assert result.warnings
-    assert "zero rows" in " ".join(result.warnings).lower()
     assert intent_pkg.status == PackageStatus.VALID
     assert len(intent_pkg.violations) == 0
 

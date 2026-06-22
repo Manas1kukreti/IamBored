@@ -335,6 +335,7 @@ def _try_llm_column_resolution(
     if not available_columns:
         return None
 
+    _telemetry_ctx = None
     try:
         from finflow_agent.llm import get_chat_groq
 
@@ -411,7 +412,6 @@ def _try_llm_column_resolution(
         )
 
         # --- Telemetry: log call start ---
-        _telemetry_ctx = None
         try:
             from finflow_agent.llm_telemetry import log_llm_started, log_llm_completed, log_llm_failed, log_runtime_event
             log_runtime_event(
