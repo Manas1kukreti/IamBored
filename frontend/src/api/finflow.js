@@ -167,6 +167,7 @@ export function mapJobDetail(detail) {
     repairAvailable: Boolean(detail.repair_available),
     extractionPreview: clarification?.extraction_preview || null,
     previewToken: detail.preview_token || "",
+    visualizations: Array.isArray(detail.visualizations) ? detail.visualizations : [],
   };
 }
 

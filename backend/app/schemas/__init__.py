@@ -3,6 +3,8 @@ from uuid import UUID
 
 from pydantic import BaseModel, EmailStr, Field
 
+from app.schemas.visualization import VisualizationSpecRead  # noqa: E402
+
 
 class UserCreate(BaseModel):
     name: str = Field(min_length=2, max_length=120)
@@ -277,3 +279,4 @@ class JobDetailRead(BaseModel):
     preview_token: str | None = None
     steps: list[JobStepRead] = Field(default_factory=list)
     audit: list[JobAuditEntryRead] = Field(default_factory=list)
+    visualizations: list[VisualizationSpecRead] = Field(default_factory=list)

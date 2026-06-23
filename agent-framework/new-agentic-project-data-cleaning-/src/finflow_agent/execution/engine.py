@@ -453,6 +453,17 @@ class ExecutionEngine:
             )
         return agent_summaries
 
+    def _extract_visualization_specs(self) -> List[Dict[str, Any]]:
+        """Extract visualization specs from the visualization agent step results."""
+        viz_result = self.step_results.get("visualize")
+        if not viz_result:
+            return []
+        artifacts = viz_result.get("artifacts") or {}
+        specs = artifacts.get("visualizations", [])
+        if isinstance(specs, list):
+            return specs
+        return []
+
     # ------------------------------------------------------------------
     # Per-step input resolution (single-source contract)
     # ------------------------------------------------------------------
@@ -839,7 +850,7 @@ class ExecutionEngine:
             return {
                 "status": "complete",
                 "output_path": output_path,
-                "summary": summary_info,
+                "summary": {**summary_info, "visualizations": self._extract_visualization_specs()},
             }
         except Exception as exc:
             duration_ms = int((time.time() - start_time) * 1000)

@@ -186,6 +186,41 @@ def test_agent_callback_creates_dead_letter_job_for_failed_status(monkeypatch):
     asyncio.run(run())
 
 
+def test_agent_callback_synchronizes_summary_status_with_submission_status(monkeypatch):
+    async def run() -> None:
+        submission = _build_submission()
+        submission.summary = {"status": "awaiting_clarification", "suggestion": "Clarify the intended operation."}
+        fake_db = FakeCallbackDb(submission, table_exists=True)
+        settings = type(
+            "Settings",
+            (),
+            {
+                "agent_callback_secret": "test-secret",
+                "enable_needs_review_jobs": True,
+            },
+        )()
+
+        monkeypatch.setattr("app.api.agent.get_settings", lambda: settings)
+        monkeypatch.setattr("app.api.agent.ws_manager.broadcast", lambda *args, **kwargs: asyncio.sleep(0))
+
+        payload = AgentCallbackPayload(
+            submission_id=str(submission.id),
+            status="succeeded",
+            summary={"status": "awaiting_clarification", "result": "done"},
+            event_id="agent:test-summary-sync",
+        )
+
+        response = await agent_callback(payload, DummyRequest({"Authorization": "Bearer test-secret"}), fake_db)
+
+        assert response["primary_state_persisted"] is True
+        assert submission.status == SubmissionStatus.succeeded
+        assert isinstance(submission.summary, dict)
+        assert submission.summary["status"] == SubmissionStatus.succeeded.value
+        assert submission.summary["result"] == "done"
+
+    asyncio.run(run())
+
+
 def test_agent_callback_duplicate_event_returns_idempotent_success(monkeypatch):
     async def run() -> None:
         submission = _build_submission()

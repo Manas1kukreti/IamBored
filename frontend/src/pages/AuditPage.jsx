@@ -4,6 +4,7 @@ import { FiCheck, FiChevronDown, FiDownload, FiRefreshCw, FiX } from "react-icon
 import { useParams } from "react-router-dom";
 import DataTable from "../components/DataTable.jsx";
 import ClarificationPanel from "../components/ClarificationPanel.jsx";
+import { VisualizationRenderer } from "../components/visualization/index.js";
 import {
   confirmInterpretation,
   rejectInterpretation,
@@ -139,6 +140,7 @@ export default function AuditPage() {
   const extractionMergedCount = Number(extractionPreview?.merged_count || 0);
   const extractionAmbiguousDateCount = Number(extractionPreview?.ambiguous_date_count || 0);
   const extractionAssumedDateConvention = String(extractionPreview?.assumed_date_convention || "");
+  const visualizations = Array.isArray(job?.visualizations) ? job.visualizations : [];
   const availableMappingColumns = useMemo(
     () => collectAvailableMappingColumns(profileColumns, schemaColumns),
     [profileColumns, schemaColumns]
@@ -357,6 +359,21 @@ export default function AuditPage() {
             {job.jobSummary || "A concise summary will appear here once the workflow finishes."}
           </p>
         </section>
+        {visualizations.length > 0 ? (
+          <section className="ff-panel ff-panel--dense ff-viz-panel">
+            <div className="ff-panel__head">
+              <div>
+                <p className="ff-eyebrow">Visual output</p>
+                <h3>{visualizations.length} generated visualization{visualizations.length === 1 ? "" : "s"}</h3>
+              </div>
+            </div>
+            <div className="ff-viz-results">
+              {visualizations.map((spec) => (
+                <VisualizationRenderer key={spec.visualization_id} spec={spec} />
+              ))}
+            </div>
+          </section>
+        ) : null}
         {job.status === "quarantined" ? (
           <div className="ff-panel ff-panel--dense">
             <div className="ff-panel__head">

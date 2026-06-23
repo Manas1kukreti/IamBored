@@ -74,6 +74,7 @@ services:
       BACKEND_BASE_URL: http://backend:8000
       AGENT_REGISTRY_SECRET: change-agent-registry-secret
       ENABLE_LLM_PREDICATE_GROUNDING: "true"
+      ENABLE_VISUALIZATION: "true"
       UPLOAD_DIR: /app/storage/uploads
       OUTPUT_DIR: /app/storage/outputs
       REDIS_URL: redis://redis:6379/0

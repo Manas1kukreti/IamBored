@@ -6,7 +6,7 @@ validator, orchestrator, filter agent, registry, bootstrap, and (when the
 flag flips on) the visualization agent registration:
 
 * ``ENABLE_VISUALIZATION`` — gate for the visualization agent. Default
-  ``False``. While ``False``, the compiler raises ``VisualizationDisabledError``
+  ``True``. While ``False``, the compiler raises ``VisualizationDisabledError``
   for any ``PlanIntent`` with ``needs_visualization=True`` and the validator
   rejects any ``ExecutionPlan`` containing a ``visualization_agent`` step.
 * ``LOW_CONFIDENCE_POLICY`` — how the filter agent reacts when a column
@@ -45,7 +45,7 @@ from typing import Literal, Optional
 
 LowConfidencePolicy = Literal["warn", "fail", "quarantine"]
 
-DEFAULT_ENABLE_VISUALIZATION: bool = False
+DEFAULT_ENABLE_VISUALIZATION: bool = True
 DEFAULT_LOW_CONFIDENCE_POLICY: LowConfidencePolicy = "fail"
 DEFAULT_CONFIDENCE_THRESHOLD: float = 0.75
 ALLOWED_LOW_CONFIDENCE_POLICIES: tuple[LowConfidencePolicy, ...] = (
@@ -141,8 +141,8 @@ def get_enable_visualization() -> bool:
 
     Reads ``ENABLE_VISUALIZATION`` from the environment on first call, then
     caches the parsed boolean for the rest of the process lifetime. The
-    default is ``False`` so the visualization agent stays disabled unless an
-    operator explicitly opts in.
+    default is ``True`` so the visualization agent is enabled unless an
+    operator explicitly opts out.
     """
     if "enable_visualization" not in _cache:
         _cache["enable_visualization"] = _parse_bool(

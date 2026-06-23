@@ -406,3 +406,10 @@ from app.models.clarification import (  # noqa: E402, F401
     ReasonCode,
     SessionStatus,
 )
+
+# Import visualization models so they are registered with Base.metadata
+from app.models.visualization import (  # noqa: E402, F401
+    JobVisualization,
+    get_visualizations_by_job_id,
+    upsert_visualization,
+)

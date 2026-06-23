@@ -357,6 +357,59 @@ async def _mark_callback_side_effect_failed(
         await db.commit()
 
 
+async def _persist_visualization_side_effect(
+    db: AsyncSession,
+    payload: AgentCallbackPayload,
+    submission: Submission,
+) -> None:
+    """Persist visualization specs from the agent callback into job_visualizations table.
+
+    The agent framework includes a 'visualizations' key in the callback summary
+    (or at the top level) containing a list of VisualizationSpec dicts. This
+    function extracts them and upserts into the job_visualizations table.
+    """
+    try:
+        # Look for visualizations in the summary
+        visualizations = []
+        if isinstance(payload.summary, dict):
+            visualizations = payload.summary.get("visualizations", [])
+
+        if not visualizations or not isinstance(visualizations, list):
+            return
+
+        from app.models.visualization import JobVisualization, upsert_visualization
+
+        for spec in visualizations:
+            if not isinstance(spec, dict):
+                continue
+            operation_id = spec.get("operation_id", "")
+            if not operation_id:
+                continue
+
+            await upsert_visualization(
+                db,
+                job_id=submission.id,
+                operation_id=operation_id,
+                spec=spec,
+                data=spec.get("data"),
+            )
+
+        logger.info(
+            "Persisted %d visualization spec(s) for submission %s",
+            len(visualizations),
+            submission.id,
+        )
+    except Exception as exc:
+        # Never let visualization persistence failure break the callback
+        logger.warning(
+            "Failed to persist visualization specs for submission %s: %s (type: %s)",
+            submission.id,
+            exc,
+            type(exc).__name__,
+            exc_info=True,
+        )
+
+
 async def _persist_needs_review_side_effect(
     *,
     db: AsyncSession,
@@ -547,6 +600,8 @@ async def agent_callback(
             submission.status = SubmissionStatus.failed
 
         merged_summary = _merge_callback_summary(prior_summary, payload.summary)
+        if isinstance(merged_summary, dict):
+            merged_summary["status"] = submission.status.value
         log_runtime_event(
             "callback_summary_keys_before",
             service="backend",
@@ -628,6 +683,10 @@ async def agent_callback(
     await db.refresh(submission)
 
     side_effects: dict[str, str] = {}
+
+    # Persist visualization specs if present in the callback
+    await _persist_visualization_side_effect(db=db, payload=payload, submission=submission)
+
     if submission.status == SubmissionStatus.quarantined:
         side_effects["needs_review_job"] = await _persist_needs_review_side_effect(
             db=db,

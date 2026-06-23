@@ -204,6 +204,10 @@ class ChartSpec(BaseModel):
     x: str
     y: Union[str, List[str]]
     title: str
+    group_by: Optional[List[str]] = None
+    measure: Optional[str] = None
+    aggregation: Optional[Literal["count", "sum", "mean"]] = None
+    output_field: Optional[str] = None
 
 class VisualizationOperationPlan(BaseModel):
     charts: List[ChartSpec]

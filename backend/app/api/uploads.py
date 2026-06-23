@@ -2,6 +2,7 @@ from copy import deepcopy
 from datetime import UTC, datetime
 from pathlib import Path
 from uuid import UUID
+import logging
 import warnings
 from typing import Any
 
@@ -17,10 +18,11 @@ from app.constants import DEFAULT_OUTPUT_FORMAT_OPTIONS
 from app.core.security import require_roles
 from app.db.session import get_db
 from app.models import AuditLog, DataProfile, Review, Submission, SubmissionRecord, SubmissionStatus, User, UserRole, normalize_submission_status
+from app.models.visualization import JobVisualization
 from app.services.agent_dispatcher import enqueue_submission_dispatch
 from app.services.canonical_intent import build_canonical_intent
 from app.services.intent_revision import persist_intent_revision
-from app.schemas import JobAgentSummaryRead, JobAuditEntryRead, JobDetailRead, JobStepRead, UploadMetadataRead, UploadPreview, UploadSummary, UploadVersionRead
+from app.schemas import JobAgentSummaryRead, JobAuditEntryRead, JobDetailRead, JobStepRead, UploadMetadataRead, UploadPreview, UploadSummary, UploadVersionRead, VisualizationSpecRead
 from app.services.excel_parser import SUPPORTED_EXTENSIONS, validate_extension
 from app.services.file_validation import validate_file_signature
 from app.services.data_profile import get_or_create_data_profile, load_latest_data_profile
@@ -33,6 +35,8 @@ from app.services.websocket_manager import ws_manager
 from pydantic import BaseModel
 import json
 from app.services.request_security import _get_redis_client
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/uploads", tags=["uploads"])
 CONTENT_TYPE_ALLOWLIST = {
@@ -1609,6 +1613,40 @@ async def get_job_detail(
     elif is_schema_approval_pending(submission):
         validation = {"valid": None, "status": SCHEMA_APPROVAL_AGENT_STATUS}
 
+    # Query visualizations from job_visualizations table (graceful on failure)
+    visualizations: list[VisualizationSpecRead] = []
+    try:
+        viz_rows = (
+            await db.execute(
+                select(JobVisualization)
+                .where(JobVisualization.job_id == submission.id)
+                .order_by(JobVisualization.created_at)
+            )
+        ).scalars().all()
+        for row in viz_rows:
+            spec = row.spec if isinstance(row.spec, dict) else {}
+            visualizations.append(
+                VisualizationSpecRead(
+                    schema_version=str(spec.get("schema_version", "")),
+                    visualization_id=str(spec.get("visualization_id", "")),
+                    operation_id=str(spec.get("operation_id", row.operation_id)),
+                    source_result_id=str(spec.get("source_result_id", "")),
+                    status=str(spec.get("status", "")),
+                    chart_type=str(spec.get("chart_type", "")),
+                    title=str(spec.get("title", "")),
+                    encoding=spec.get("encoding") if isinstance(spec.get("encoding"), dict) else {},
+                    data=spec.get("data") if isinstance(spec.get("data"), list) else [],
+                    options=spec.get("options") if isinstance(spec.get("options"), dict) else {},
+                    warnings=spec.get("warnings") if isinstance(spec.get("warnings"), list) else [],
+                    error=spec.get("error"),
+                )
+            )
+    except Exception:
+        logger.warning(
+            "Failed to retrieve visualizations for submission %s", submission.id, exc_info=True
+        )
+        visualizations = []
+
     return JobDetailRead(
         id=submission.id,
         sub_id=submission.sub_id,
@@ -1634,6 +1672,7 @@ async def get_job_detail(
         repair_available=not data_profile_payload and bool(submission.file_path),
         steps=build_job_steps(submission),
         audit=build_job_audit(submission, logs),
+        visualizations=visualizations,
     )
 
 

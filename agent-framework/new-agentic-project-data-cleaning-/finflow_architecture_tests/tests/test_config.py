@@ -1,7 +1,7 @@
 """Unit tests for ``finflow_agent.tools.config``.
 
 Covers task 1.1 of the agent-pipeline-hardening spec:
-- Defaults match the spec (ENABLE_VISUALIZATION=False, LOW_CONFIDENCE_POLICY="fail",
+- Defaults match the spec (ENABLE_VISUALIZATION=True, LOW_CONFIDENCE_POLICY="fail",
   CONFIDENCE_THRESHOLD=0.75).
 - Each accessor parses valid environment values correctly.
 - Each accessor rejects invalid environment values with a clear ValueError.
@@ -43,7 +43,7 @@ def _clear_config_cache_around_each_test(monkeypatch):
 def test_defaults_when_no_env_vars_set():
     from finflow_agent.tools import config
 
-    assert config.get_enable_visualization() is False
+    assert config.get_enable_visualization() is True
     assert config.get_low_confidence_policy() == "fail"
     assert config.get_confidence_threshold() == pytest.approx(0.75)
 
@@ -51,7 +51,7 @@ def test_defaults_when_no_env_vars_set():
 def test_module_level_default_constants_match_spec():
     from finflow_agent.tools import config
 
-    assert config.DEFAULT_ENABLE_VISUALIZATION is False
+    assert config.DEFAULT_ENABLE_VISUALIZATION is True
     assert config.DEFAULT_LOW_CONFIDENCE_POLICY == "fail"
     assert config.DEFAULT_CONFIDENCE_THRESHOLD == pytest.approx(0.75)
     assert set(config.ALLOWED_LOW_CONFIDENCE_POLICIES) == {"warn", "fail", "quarantine"}

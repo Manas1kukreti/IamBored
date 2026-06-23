@@ -3915,6 +3915,52 @@ body {
   gap: 22px;
 }
 
+.ff-viz-panel {
+  gap: 18px;
+}
+
+.ff-viz-results {
+  display: grid;
+  gap: 18px;
+}
+
+.ff-viz-renderer {
+  display: grid;
+  gap: 14px;
+  padding: 18px;
+  border: 1px solid rgba(126, 157, 255, 0.18);
+  border-radius: 20px;
+  background: linear-gradient(180deg, rgba(14, 24, 42, 0.88), rgba(11, 18, 32, 0.94));
+}
+
+.ff-viz-renderer__title {
+  margin: 0;
+  font-size: 18px;
+  line-height: 1.25;
+  letter-spacing: -0.03em;
+  color: var(--ff-white-ey);
+}
+
+.ff-viz-chart {
+  min-height: 320px;
+}
+
+.ff-viz-state {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  gap: 12px;
+  align-items: center;
+  padding: 16px 18px;
+  border: 1px solid rgba(126, 157, 255, 0.18);
+  border-radius: 18px;
+  background: rgba(255, 255, 255, 0.03);
+}
+
+.ff-viz-state__message {
+  margin: 0;
+  color: var(--ff-text-secondary);
+}
+
 .ff-panel__head h2,
 .ff-panel__head h3,
 .ff-hero-panel h2 {

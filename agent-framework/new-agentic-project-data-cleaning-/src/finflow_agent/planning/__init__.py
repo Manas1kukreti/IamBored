@@ -11,13 +11,21 @@ Compiler class from the semantic-grounding-refactor spec.
 
 def __getattr__(name: str):
     """Lazy module-level attribute access for planning package exports."""
-    _exports = {
+    _compiler_exports = {
         "CompilerError",
         "ExecutionStep",
         "RefactoredExecutionPlan",
         "Compiler",
     }
-    if name in _exports:
+    _trigger_exports = {
+        "TriggerDetector",
+        "TriggerResult",
+    }
+    _enricher_exports = {
+        "enrich_intent_with_visualization",
+        "should_produce_visualization",
+    }
+    if name in _compiler_exports:
         from finflow_agent.planning.compiler import (
             CompilerError,
             ExecutionStep,
@@ -31,6 +39,26 @@ def __getattr__(name: str):
             "Compiler": Compiler,
         }
         return _mapping[name]
+    if name in _trigger_exports:
+        from finflow_agent.planning.trigger_detector import (
+            TriggerDetector,
+            TriggerResult,
+        )
+        _mapping = {
+            "TriggerDetector": TriggerDetector,
+            "TriggerResult": TriggerResult,
+        }
+        return _mapping[name]
+    if name in _enricher_exports:
+        from finflow_agent.planning.intent_enricher import (
+            enrich_intent_with_visualization,
+            should_produce_visualization,
+        )
+        _mapping = {
+            "enrich_intent_with_visualization": enrich_intent_with_visualization,
+            "should_produce_visualization": should_produce_visualization,
+        }
+        return _mapping[name]
     raise AttributeError(f"module 'finflow_agent.planning' has no attribute {name!r}")
 
 
@@ -39,4 +67,8 @@ __all__ = [
     "ExecutionStep",
     "RefactoredExecutionPlan",
     "Compiler",
+    "TriggerDetector",
+    "TriggerResult",
+    "enrich_intent_with_visualization",
+    "should_produce_visualization",
 ]

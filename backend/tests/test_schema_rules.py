@@ -115,6 +115,27 @@ def test_canonical_intent_select_all_projection_is_resolved():
     assert projection["resolution_status"] in {"resolved", "repaired"}
 
 
+def test_canonical_intent_preserves_ratio_and_pie_semantics():
+    columns = ["gender", "age", "name"]
+
+    result = build_canonical_intent(columns, [], "Clean this data and show the male-to-female ratio as a pie chart.")
+
+    action_kinds = [action["kind"] for action in result["actions"]]
+    assert "calculate" in action_kinds
+    assert "visualize" in action_kinds
+
+    calculate = next(action for action in result["actions"] if action["kind"] == "calculate")
+    operation = calculate["operations"][0]
+    assert operation["type"] == "group_count"
+    assert operation["group_by"][0]["resolved_column"] == "gender"
+    assert operation["output_column"] == "gender_count"
+
+    visualize = next(action for action in result["actions"] if action["kind"] == "visualize")
+    assert visualize["chart_type"] == "pie"
+    assert visualize["fields"][0]["resolved_column"] == "gender"
+    assert result["resolution_status"] in {"resolved", "repaired"}
+
+
 def test_data_profile_build_is_deterministic_and_bounded():
     csv_path = Path(__file__).with_name(".tmp_profile.csv")
     try:

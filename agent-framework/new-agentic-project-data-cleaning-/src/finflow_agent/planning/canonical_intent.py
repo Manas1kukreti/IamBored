@@ -121,6 +121,10 @@ class VisualizeIntent(BaseModel):
     kind: Literal["visualize"]
     chart_type: str | None = None
     fields: list[UnresolvedColumnReference] = Field(default_factory=list)
+    group_by: list[str] | None = None
+    measure: str | None = None
+    aggregation: Literal["count", "sum", "mean"] | None = None
+    output_field: str | None = None
 
 
 class ReportIntent(BaseModel):
